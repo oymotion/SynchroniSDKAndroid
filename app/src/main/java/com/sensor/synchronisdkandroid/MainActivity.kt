@@ -53,7 +53,7 @@ class MainActivity : AppCompatActivity() {
                                 SensorController.SensorControllerDelegate { bleDevices ->
                                     SensorController.getInstance().stopScan();
                                     for (device in bleDevices) {
-                                        if (!(device.name.startsWith("SYNC") || device.name.startsWith("OB"))) continue
+                                        if (!(device.name.startsWith("OB") || device.name.startsWith("OYWW"))) continue
                                         Log.d("DEMO", "found device: " + device.name);
                                         val sensor = SensorController.getInstance().getSensor(device.mac);
                                         if (sensor.deviceState == BLEDevice.State.Disconnected) {
@@ -72,7 +72,7 @@ class MainActivity : AppCompatActivity() {
                                                     )
                                                     if (newState == BLEDevice.State.Ready){
                                                         if (!profile.hasInit()){
-                                                            sensor.initALL(5, 6000, SensorProfile.Callback { result, errorMsg ->
+                                                            sensor.initALL(8, 6000, SensorProfile.Callback { result, errorMsg ->
                                                                 if (result < 0){
                                                                     Log.d("DEMO",
                                                                         profile.device.name + " Init fail: $errorMsg"
@@ -93,15 +93,28 @@ class MainActivity : AppCompatActivity() {
                                                 }
 
                                                 override fun onSensorNotifyData(profile: SensorProfile, rawData: SensorData) {
-                                                    Log.d("DEMO",
-                                                        profile.device.name + " got data type: " + rawData.dataType + " | " + rawData.channelSamples[0][0].sampleIndex
-                                                    )
-                                                    if (rawData.dataType == SensorData.NTF_EEG){
 
-                                                    }
-                                                    sensor.stopDataNotification(SensorProfile.Callback { _, _ ->
+                                                    if (rawData.dataType == SensorData.NTF_EMG_ADC_DATA){
+                                                        Log.d("DEMO",
+                                                            profile.device.name + " got data type: " + rawData.dataType + " | " + rawData.channelSamples[0][0].sampleIndex + rawData.dataType + " | " + rawData.channelSamples[0][0].data
+                                                        )
+                                                    }else if (rawData.dataType == SensorData.NTF_ACC_DATA){
+                                                        Log.d("DEMO",
+                                                            profile.device.name + " got data type: " + rawData.dataType + " | " + rawData.channelSamples[0][0].sampleIndex + rawData.dataType + " | " + rawData.channelSamples[0][0].data + " | " + rawData.channelSamples[1][0].data + " | " + rawData.channelSamples[2][0].data
+                                                        )
+                                                        sensor.stopDataNotification(SensorProfile.Callback { _, _ ->
+                                                        })
+                                                    }else if (rawData.dataType == SensorData.NTF_GYO_DATA){
+                                                        Log.d("DEMO",
+                                                            profile.device.name + " got data type: " + rawData.dataType + " | " + rawData.channelSamples[0][0].sampleIndex + rawData.dataType + " | " + rawData.channelSamples[0][0].data + " | " + rawData.channelSamples[1][0].data + " | " + rawData.channelSamples[2][0].data
+                                                        )
                                                         sensor.disconnect()
-                                                    })
+                                                    }else{
+                                                        Log.d("DEMO",
+                                                            profile.device.name + " got data type: " + rawData.dataType + " | " + rawData.channelSamples[0][0].sampleIndex + rawData.dataType
+                                                        );
+                                                    }
+
                                                 }
                                             }
                                         }
