@@ -72,6 +72,13 @@ class MainActivity : AppCompatActivity() {
                                                     )
                                                     if (newState == BLEDevice.State.Ready){
                                                         if (!profile.hasInit()){
+                                                            sensor.setParam("FILTER_50HZ", "OFF", 6000, SensorProfile.Callback { result, errorMsg ->
+
+                                                                Log.d("DEMO",
+                                                                    profile.device.name + " set filter: $errorMsg"
+                                                                )
+
+                                                            })
                                                             sensor.initALL(8, 6000, SensorProfile.Callback { result, errorMsg ->
                                                                 if (result < 0){
                                                                     Log.d("DEMO",
