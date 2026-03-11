@@ -72,27 +72,29 @@ class MainActivity : AppCompatActivity() {
                                                     )
                                                     if (newState == BLEDevice.State.Ready){
                                                         if (!profile.hasInit()){
-                                                            sensor.setParam("FILTER_50HZ", "OFF", 6000, SensorProfile.Callback { result, errorMsg ->
-
-                                                                Log.d("DEMO",
-                                                                    profile.device.name + " set filter: $errorMsg"
-                                                                )
-
-                                                            })
                                                             sensor.initALL(8, 6000, SensorProfile.Callback { result, errorMsg ->
                                                                 if (result < 0){
                                                                     Log.d("DEMO",
                                                                         profile.device.name + " Init fail: $errorMsg"
                                                                     )
                                                                 }else{
+
                                                                     sensor.getBatteryLevel(6000) { result2, _ ->
                                                                         Log.d("DEMO",profile.device.name + " device info: " + sensor.deviceInfo.firmwareVersion + " Power is: $result2")
                                                                         sensor.startDataNotification(SensorProfile.Callback { _, _ ->
                                                                             Log.d("DEMO", profile.device.name + " Data started")
                                                                         })
                                                                     }
+                                                                    sensor.setParam("FILTER_50HZ", "OFF", 6000, SensorProfile.Callback { result, errorMsg ->
+
+                                                                        Log.d("DEMO",
+                                                                            profile.device.name + " set filter: $errorMsg"
+                                                                        )
+
+                                                                    })
                                                                 }
                                                             })
+
                                                         }
                                                     }else if (newState == BLEDevice.State.Disconnected){
                                                         Log.d("DEMO", "Please purge your cache data")
