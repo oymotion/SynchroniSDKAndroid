@@ -9,21 +9,11 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
 
-/**
- * Real-time band filter for the bio waveforms (EMG/EEG/ECG/BRTH/PPG/SpO2),
- * ported from the Qt demo's LiveFilter (DemoNewMulti Live Filter combo
- * parity): a causal 4th-order Butterworth bandpass whose per-channel state
- * carries over between data batches, applied on the data thread right
- * before the samples enter the display rings. The selected band is a UI
- * choice shared by every device; switching the band (or a stream sample-rate
- * change) rebuilds the filter state, and the rings replace old samples
- * naturally as new data arrives.
- */
+// Real-time band filter for the bio waveforms (EMG/EEG/ECG/BRTH/PPG/SpO2).
 class LiveFilter {
 
     companion object {
-        // (label, low Hz, high Hz); index 0 = Off. The Greek letters are
-        // written as unicode escapes to keep the source file ASCII-only.
+        // (label, low Hz, high Hz); index 0 = Off.
         private val BAND_LABELS = arrayOf(
             "Off",
             "\u03B4 0.5-4Hz",
@@ -37,7 +27,7 @@ class LiveFilter {
         private const val ORDER = 4
         private const val PI = 3.14159265358979323846
 
-        /** Band index 0 is Off. bandLabels() feeds the filter spinner. */
+        // Band index 0 is Off.
         fun bandLabels(): List<String> = BAND_LABELS.toList()
     }
 
@@ -49,8 +39,7 @@ class LiveFilter {
         var rate = 0f
         var sections: List<Biquad> = emptyList()
 
-        // Per-section unit-step steady state, used as each channel's initial
-        // filter state (scipy sosfilt_zi equivalent).
+        // Per-section initial filter state.
         var zi0: List<DoubleArray> = emptyList()
 
         // channel -> per-section running state.
@@ -61,29 +50,26 @@ class LiveFilter {
     private var band = 0
     private val streams = HashMap<Int, StreamState>()    // key: data type
 
-    /** UI thread. Out-of-range indexes select Off. */
+    // Out-of-range indexes select Off.
     fun setBand(bandIndex: Int) {
         synchronized(lock) {
             band = if (bandIndex > 0 && bandIndex < BAND_LABELS.size) bandIndex else 0
-            // A band switch rebuilds every stream's filter state; old ring
-            // contents scroll out with new data, so the rings are not cleared.
+            // A band switch rebuilds every stream's filter state.
             streams.clear()
         }
     }
 
-    /** Currently selected band index (0 = Off). */
+    // Currently selected band index (0 = Off).
     fun band(): Int = synchronized(lock) { band }
 
-    /** Drops all designed filters and channel states (device switch / clear). */
+    // Drops all designed filters and channel states.
     fun reset() {
         synchronized(lock) { streams.clear() }
     }
 
-    /**
-     * Data thread: filters one channel batch in place. Pass-through when Off,
-     * when the rate is unknown/invalid, or when the band top exceeds the
-     * Nyquist frequency (e.g. the 1 Hz SpO2 stream).
-     */
+    // Filters one channel batch in place. Pass-through when Off, when the
+    // rate is unknown/invalid, or when the band top exceeds the Nyquist
+    // frequency.
     fun apply(dataType: Int, channel: Int, vals: FloatArray, sampleRate: Float) {
         if (vals.isEmpty()) {
             return
@@ -94,8 +80,7 @@ class LiveFilter {
             }
             val st = streams.getOrPut(dataType) { StreamState() }
             if (st.band != band || st.rate != sampleRate) {
-                // Band or sample-rate change: redesign and reset every
-                // channel state.
+                // Band or sample-rate change: redesign.
                 st.sections = emptyList()
                 st.zi0 = emptyList()
                 st.channels.clear()
@@ -103,16 +88,11 @@ class LiveFilter {
                 st.rate = sampleRate
                 val designed = design(band, sampleRate.toDouble())
                 if (designed == null) {
-                    // Invalid band/rate (e.g. the band top exceeds Nyquist):
-                    // keep the empty section list as the pass-through marker
-                    // until the band or rate changes again.
+                    // Invalid band/rate: pass-through.
                     return
                 }
                 st.sections = designed
-                // Unit-step steady state per section (scipy sosfilt_zi
-                // equivalent): with a constant input u, a section settles at
-                // output y = G*u where G is its DC gain, and the states
-                // follow from the fixed point.
+                // Initial channel state.
                 val zi0 = ArrayList<DoubleArray>(designed.size)
                 var u = 1.0
                 for (s in designed) {
@@ -144,7 +124,7 @@ class LiveFilter {
         }
     }
 
-    /** Minimal complex arithmetic for the filter design math. */
+    // Minimal complex arithmetic for the filter design math.
     private class C(val re: Double, val im: Double) {
         operator fun plus(o: C) = C(re + o.re, im + o.im)
         operator fun minus(o: C) = C(re - o.re, im - o.im)
@@ -171,11 +151,8 @@ class LiveFilter {
         }
     }
 
-    /**
-     * Butterworth bandpass design (order 4): analog prototype -> lp2bp ->
-     * bilinear, grouped into second-order sections. Returns null when the
-     * band is invalid for the rate.
-     */
+    // Butterworth bandpass design (order 4). Returns null when the band is
+    // invalid for the rate.
     private fun design(bandIndex: Int, fs: Double): List<Biquad>? {
         if (bandIndex <= 0 || bandIndex >= BAND_LABELS.size || fs <= 0.0) {
             return null
@@ -183,39 +160,35 @@ class LiveFilter {
         val lo = BAND_LO[bandIndex]
         val hi = BAND_HI[bandIndex]
         if (hi >= fs / 2.0) {
-            return null   // band top beyond the Nyquist frequency
+            return null
         }
-        // Prewarp to the analog domain.
+        // Prewarp.
         val w1 = 2.0 * fs * tan(PI * lo / fs)
         val w2 = 2.0 * fs * tan(PI * hi / fs)
         val bw = w2 - w1
         val wo = sqrt(w1 * w2)
         val fs2 = 2.0 * fs
 
-        // Analog Butterworth lowpass prototype poles (no finite zeros, gain 1).
+        // Analog prototype poles -> bandpass poles -> z-plane poles.
         val poles = ArrayList<C>()
-        val zeros = ArrayList<C>()   // z-plane zeros, filled below
+        val zeros = ArrayList<C>()
         for (k in 0 until ORDER) {
             val ang = PI * (2.0 * k + 1 + ORDER) / (2.0 * ORDER)
             val p = C.polar(1.0, ang)
-            // lp2bp: each pole maps to the roots of s^2 - bw*p*s + wo^2 = 0.
             val mid = p * (0.5 * bw)
             val disc = C.sqrt(mid * mid - C.real(wo * wo))
             val sp1 = mid + disc
             val sp2 = mid - disc
-            // Bilinear transform z = (2fs + s) / (2fs - s).
             poles.add((sp1 + fs2) / (C.real(fs2) - sp1))
             poles.add((sp2 + fs2) / (C.real(fs2) - sp2))
         }
-        // Prototype zeros: ORDER zeros at s=0 (-> z=+1) plus ORDER zeros at
-        // infinity (-> z=-1).
+        // Zeros.
         for (k in 0 until ORDER) {
             zeros.add(C.real(1.0))
             zeros.add(C.real(-1.0))
         }
-        // Gain: k_bp = bw^order; k_z = k_bp * prod(2fs - z_s) / prod(2fs - p_s)
-        // over the finite analog zeros (all at s=0) and poles.
-        val gain = C.real(bw.pow(ORDER)).times(fs2.pow(ORDER))  // prod over the s=0 zeros
+        // Gain.
+        val gain = C.real(bw.pow(ORDER)).times(fs2.pow(ORDER))
         var denom = C.real(1.0)
         for (k in 0 until ORDER) {
             val ang = PI * (2.0 * k + 1 + ORDER) / (2.0 * ORDER)
@@ -226,9 +199,7 @@ class LiveFilter {
         }
         val kz = (gain / denom).re
 
-        // Group into biquads: pair each pole with its conjugate and hand the
-        // pair its two nearest zeros (the overall response is
-        // pairing-independent).
+        // Group into biquads.
         val sections = ArrayList<Biquad>()
         while (poles.isNotEmpty()) {
             val p = poles.removeAt(poles.size - 1)

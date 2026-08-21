@@ -302,8 +302,14 @@ profile.setParam("FILTER_LPF", "ON")   // 80 Hz low-pass
 // against getParam("EEG_SAMPLE_RATE_LIST")
 profile.setParam("EEG_SAMPLE_RATE", "500")
 
+// NeuCir remote control (NeuCir devices only)
+profile.setParam("NEUCIR_SET_MODE", "APP_REMOTE")
+profile.setParam("NEUCIR_APP_CONTROL", "OPEN")   // OPEN / CLOSE / STOP
+
 // Bin export: "True" exports the session capture on stop/disconnect into
-// the SDK log directory; an absolute path exports there; "False"/"" disables
+// the SDK log directory; an absolute path exports there; "False"/"" disables.
+// Once set, the capture is written directly at that path (visible while
+// streaming); without a path it is copied there on stop/disconnect
 profile.setParam("DEBUG_BLE_DATA_PATH", "True")
 
 // Per-profile log file in the SDK log directory ("True"), or an absolute

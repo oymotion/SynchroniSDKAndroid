@@ -12,20 +12,13 @@ import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.sin
 
-/**
- * Hann-windowed one-sided magnitude spectrum of the snapshot channels
- * (DemoNewMulti _compute_fft parity, port of the Qt demo's SpectrumCompute):
- * radix-2 FFT over the zero-padded window, amplitudes normalized by the
- * window gain so a peak reads close to the true amplitude. Computed off the
- * UI thread (the demo's shared spectrum worker).
- */
+// One-sided magnitude spectrum of the snapshot channels.
 internal object SpectrumCompute {
 
     class Result(val freqs: FloatArray, val mags: Array<FloatArray>)
 
     private const val PI = 3.14159265358979323846
 
-    /** Returns null for empty/short input (< 16 samples) or an unknown rate. */
     fun compute(channels: Array<FloatArray>, rate: Float): Result? {
         if (channels.isEmpty() || rate <= 0f) {
             return null
@@ -38,7 +31,7 @@ internal object SpectrumCompute {
         while (nfft < n) {
             nfft = nfft shl 1
         }
-        // Hann window over the actual samples (zero tail is not windowed).
+        // Hann window.
         val window = DoubleArray(n)
         var winSum = 0.0
         for (i in 0 until n) {
@@ -65,7 +58,7 @@ internal object SpectrumCompute {
         return Result(freqs, mags.toTypedArray())
     }
 
-    /** In-place iterative radix-2 FFT (bit-reversal + butterflies). */
+    // In-place iterative radix-2 FFT.
     private fun fft(re: DoubleArray, im: DoubleArray, n: Int) {
         var j = 0
         for (i in 1 until n) {
@@ -109,13 +102,7 @@ internal object SpectrumCompute {
     }
 }
 
-/**
- * Magnitude-spectrum strip below a waveform view (port of the Qt demo's
- * SpectrumWidget): dark background, one polyline per channel in the
- * waveform's channel colors, per-channel labels top-left, auto-Y scale, and
- * "0" / "<fmax> Hz" axis texts. The FFT runs on a worker thread; this view
- * only draws the latest result handed to setResult().
- */
+// Magnitude-spectrum strip below a waveform view.
 class SpectrumView(context: Context) : View(context) {
 
     private val lock = Any()
@@ -123,8 +110,10 @@ class SpectrumView(context: Context) : View(context) {
     private var mags: Array<FloatArray> = emptyArray()
     private var placeholder = "Waiting for data ..."
 
-    // Channel colors: same table as WaveformView so a spectrum curve matches
-    // its waveform trace.
+    // Per-channel labels drawn top-left.
+    @Volatile var labels: Array<String> = emptyArray()
+
+    // Channel colors.
     private val channelColors = intArrayOf(
         Color.rgb(0, 200, 200), Color.rgb(230, 80, 200), Color.rgb(230, 210, 60),
         Color.rgb(230, 90, 60), Color.rgb(90, 200, 90), Color.rgb(90, 130, 240),
@@ -205,7 +194,7 @@ class SpectrumView(context: Context) : View(context) {
             return
         }
 
-        // Auto Y range across all channels (matplotlib relim/autoscale parity).
+        // Auto Y range across all channels.
         var peak = 0.0
         for (row in m) {
             for (v in row) {
@@ -230,7 +219,8 @@ class SpectrumView(context: Context) : View(context) {
             canvas.drawPath(path, linePaint)
 
             labelPaint.color = color
-            canvas.drawText("ch$ch", plotL + 4,
+            val label = if (ch < labels.size) labels[ch] else "ch$ch"
+            canvas.drawText(label, plotL + 4,
                 plotT + labelPaint.textSize * (ch + 1), labelPaint)
         }
         canvas.restore()

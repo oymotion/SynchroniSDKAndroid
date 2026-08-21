@@ -9,23 +9,14 @@ import android.view.View
 import com.oymotion.sensor.capi.SensorData
 import kotlin.math.max
 
-/**
- * Multi-channel scrolling waveform view (RingBuffer semantics follow the Qt
- * demo's DeviceState): one float ring per channel, batches are appended
- * sequentially, a forward jump in startSampleIndex is filled with zeros, and
- * stale/out-of-range slots read as zero (the batch path never throws).
- *
- * Threading: appendBatch/clear are synchronized and safe to call from the
- * data worker thread; the drawing itself always runs on the UI thread,
- * driven by a periodic UI timer.
- */
+// Multi-channel scrolling waveform view.
 class WaveformView @JvmOverloads constructor(
     context: Context,
     private var viewChannels: Int = 8,
     capacity: Int = 1250
 ) : View(context) {
 
-    // Ring length; mutable so rebuildForRate can re-size the time window.
+    // Ring length.
     private var capacity: Int = capacity
 
     private val lock = Any()
@@ -34,40 +25,29 @@ class WaveformView @JvmOverloads constructor(
     private var filled = 0
     private var lastSampleIndex = -1
 
-    // Nominal rate of the appended data (drives the FFT spectra); 0 until
-    // the first batch or rebuildForRate.
+    // Nominal rate of the appended data; 0 until the first batch.
     @Volatile private var sampleRate = 0f
 
-    // Bumped on every ring reset/rebuild; a spectrum result computed from an
-    // older generation is stale and dropped.
+    // Bumped on every ring reset/rebuild.
     @Volatile var ringGeneration = 0
         private set
 
     var title: String = ""
 
-    /**
-     * Curve color override (Qt WaveformWidget setSource colorIndex parity):
-     * >= 0 picks the palette slot for the curve instead of the channel index,
-     * so a paged/single-channel view keeps the color of the real channel.
-     * Set from the UI thread.
-     */
+    // Per-channel row labels drawn at the left of each row.
+    @Volatile var labels: Array<String> = emptyArray()
+
+    // Curve color palette override; -1 = follow the channel index.
     @Volatile var colorIndex = -1
 
-    /**
-     * Right-side annotation (Qt WaveformWidget setSideText parity): drawn in
-     * the reserved right margin, vertically centered (the bio slots use it
-     * for the impedance readout). Empty = hidden. Set from the UI thread.
-     */
+    // Right-side annotation drawn in the reserved right margin; empty = hidden.
     @Volatile var sideText: String = ""
     @Volatile var sideColor: Int = Color.WHITE
 
-    /**
-     * Centered text shown while the ring is still empty (an unbound bio slot
-     * sets it to "Waiting for data ...", a blank slot leaves it empty).
-     */
+    // Centered text shown while the ring is empty.
     @Volatile var placeholder: String = ""
 
-    /** Current channel count (for channel-count mismatch checks). */
+    // Current channel count.
     val channels: Int
         get() = viewChannels
 
@@ -89,8 +69,7 @@ class WaveformView @JvmOverloads constructor(
         color = Color.WHITE
         textSize = 22f
     }
-    // Reserved right margin for the side text (Qt WaveformWidget kSideMargin
-    // parity, density-scaled); the plot area never uses it.
+    // Reserved right margin for the side text.
     private val sideMargin = 66f * context.resources.displayMetrics.density
     private val paths = Array(viewChannels) { Path() }
 
@@ -103,7 +82,7 @@ class WaveformView @JvmOverloads constructor(
         Color.rgb(250, 120, 120)
     )
 
-    /** Reconfigures the channel count (drops current content). */
+    // Reconfigures the channel count (drops current content).
     fun setChannels(channels: Int) {
         synchronized(lock) {
             viewChannels = channels
@@ -127,14 +106,8 @@ class WaveformView @JvmOverloads constructor(
         postInvalidate()
     }
 
-    /**
-     * Rebuilds the rings for a new nominal sample rate, keeping the
-     * channel count: zeroed content, write position reset, and length =
-     * rate * windowSeconds so the horizontal time window stays consistent
-     * with the actual data rate. No-op when the rate is not positive or
-     * the computed length already matches. Drawing reads the ring length
-     * at paint time, so no further refresh is needed.
-     */
+    // Rebuilds the rings for a new nominal sample rate, keeping the
+    // channel count.
     fun rebuildForRate(rate: Float, windowSeconds: Double) {
         if (rate <= 0f) return
         val newCapacity = max(1, (rate * windowSeconds).toInt())
@@ -151,15 +124,9 @@ class WaveformView @JvmOverloads constructor(
         postInvalidate()
     }
 
-    /**
-     * Appends one batch: reads `channels` channels of `data` starting at
-     * `srcChannelOffset`. One isDataValid() probe decides the whole batch
-     * (false = stale batch: Your data process runs too slow cause it);
-     * isChannelEnabled gates masked-out channels to zero; the remaining
-     * single values go through getData. `channelFilter` (when given) runs
-     * per channel on the extracted batch before the samples enter the ring
-     * (the bio waveforms pass the Live Filter here).
-     */
+    // Appends one batch: reads `channels` channels of `data` starting at
+    // `srcChannelOffset`; `channelFilter` (when given) runs per channel
+    // before the samples enter the ring.
     fun appendBatch(data: SensorData, srcChannelOffset: Int, channels: Int,
                     channelFilter: ((channel: Int, vals: FloatArray) -> Unit)? = null) {
         val n = minOf(channels, viewChannels, data.channelCount - srcChannelOffset)
@@ -167,8 +134,6 @@ class WaveformView @JvmOverloads constructor(
         if (data.sampleRate > 0) sampleRate = data.sampleRate
         val fresh = data.isDataValid()
         val enabled = BooleanArray(n) { data.isChannelEnabled(srcChannelOffset + it) }
-        // Channel-major values first, so the optional channel filter sees one
-        // channel's whole batch at once.
         val vals = Array(n) { ch ->
             FloatArray(data.sampleCount) { i ->
                 if (fresh && enabled[ch]) data.getData(srcChannelOffset + ch, i) else 0f
@@ -194,19 +159,16 @@ class WaveformView @JvmOverloads constructor(
         }
     }
 
-    /** Time-ordered ring snapshot for the spectrum worker. */
+    // Time-ordered ring snapshot for the spectrum worker.
     class SpectrumSnapshot(
         val channels: Array<FloatArray>,
         val rate: Float,
         val generation: Int,
     )
 
-    /**
-     * Returns a time-ordered (oldest -> newest) copy of the full ring plus
-     * the nominal rate and ring generation, or null while the rate is
-     * unknown (no data appended yet). The snapshot is a private copy, so the
-     * worker thread can compute on it while the ring keeps filling.
-     */
+    // Returns a time-ordered (oldest -> newest) copy of the full ring plus
+    // the nominal rate and ring generation, or null while the rate is
+    // unknown.
     fun snapshotForSpectrum(): SpectrumSnapshot? {
         synchronized(lock) {
             if (sampleRate <= 0f || capacity < 16) return null
@@ -283,7 +245,10 @@ class WaveformView @JvmOverloads constructor(
             linePaint.color = channelColors[colorIdx % channelColors.size]
             canvas.drawPath(path, linePaint)
             // Single-channel slots carry the channel label in `title`.
-            if (channels > 1) canvas.drawText("ch$ch", 6f, mid - 4f, textPaint)
+            if (channels > 1) {
+                val rowLabel = if (ch < labels.size) labels[ch] else "ch$ch"
+                canvas.drawText(rowLabel, 6f, mid - 4f, textPaint)
+            }
         }
         if (sideText.isNotEmpty()) {
             sideTextPaint.color = sideColor

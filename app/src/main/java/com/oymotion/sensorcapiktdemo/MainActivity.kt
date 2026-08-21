@@ -46,30 +46,28 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Logcat tag for headless verification (data counters, replay lifecycle). */
+// Logcat tag.
 private const val TAG = "SensorCapiKtDemo"
 
-/** Queue-mode UI refresh period (ms); the views redraw from their rings. */
+// UI refresh period (ms).
 private const val UI_REFRESH_INTERVAL_MS = 50L
 
-/** Queue-mode backlog cap; a full queue drops the oldest batch. */
+// Data queue backlog cap.
 private const val DATA_QUEUE_CAPACITY = 1000
 
-/** Spectrum recompute interval (ms); the FFT runs on a worker thread. */
+// Spectrum recompute interval (ms).
 private const val FFT_UPDATE_INTERVAL_MS = 500L
 
-/** The demo's own version (Qt demo DEMO_VERSION parity), shown in the title. */
-private const val DEMO_VERSION = "0.0.9"
+// The demo's own version, shown in the title.
+private const val DEMO_VERSION = "0.1.2"
 
-/** EEG sample rate options offered on the Device page (Hz). */
-private val SAMPLE_RATE_CANDIDATES = listOf(250, 500)
+// EEG sample rate options offered on the Device page (Hz).
+private val SAMPLE_RATE_CANDIDATES = listOf(250, 500, 1000, 2000)
 
-/** Battery reading stable band (%, Qt POWER_STABLE_BAND parity): hold the
- * displayed value while a valid reading differs by less than this. */
+// Battery reading stable band (%).
 private const val POWER_STABLE_BAND = 4
 
-/** Bio page slot count (Qt MainWindow::_bioWidgets parity): 8 single-channel
- * waveform slots per device, paged in EEG mode. */
+// Bio page slot count.
 private const val BIO_SLOT_COUNT = 8
 
 // Impedance array kinds (per-device, indexed by channel).
@@ -78,8 +76,7 @@ private const val IMP_EEG = 1
 private const val IMP_ECG = 2
 private const val IMP_BRTH = 3
 
-/** Per-type stats display order and labels (Qt DeviceState::buildStatusText
- * parity); only types that have delivered data are shown. */
+// Per-type stats display order and labels.
 private val TYPE_DISPLAY_ORDER = listOf(
     DataType.NTF_ACC to "ACC",
     DataType.NTF_GYRO to "Gyro",
@@ -95,55 +92,17 @@ private val TYPE_DISPLAY_ORDER = listOf(
     DataType.NTF_GEST to "GEST",
 )
 
-/**
- * Device-list row highlight: subtle blue-gray background on the SELECTED row
- * (the Connect/Disconnect target). Unselected rows stay transparent so the
- * list keeps its plain look.
- */
+// Device-list row highlight: the SELECTED row (Connect/Disconnect target).
 private val ROW_SELECTED_BG = Color.rgb(0xDC, 0xE9, 0xF5)
 private val ROW_DEFAULT_BG = Color.TRANSPARENT
 
-/** Gesture box text before the first gesture sample (Qt parity; the
- * "possiblity" spelling is intentional). */
+// Gesture box text before the first gesture sample.
 private const val GESTURE_EMPTY_TEXT =
     "Gesture:\n  gesture: -- (0-8)\n  raw gesture: -- (0-8)\n" +
     "  possiblity: -- (0-100)\n  strength: -- (0-100)"
 
-/**
- * Kotlin sen_capi demo: scan -> connect -> init -> stream, with a
- * QTabWidget-style mobile layout (Device / Bio / IMU pages) mirroring
- * the Qt demo. MULTI-DEVICE (Qt MainWindow parity): any number of devices
- * can be connected and streaming at the same time; each connected device
- * gets a DeviceUiState keyed by mac holding its own page contents (bio
- * waveforms, IMU waveforms + spectrum strips, cube), data counters, bio
- * mode detection, DeviceInfo and Live Filter state. Clicking a connected
- * device in the scan list makes it the CURRENT device whose pages are
- * shown and whose profile the NTF/sample-rate controls target; switching
- * the current device swaps the page contents, so a backgrounded device
- * keeps streaming into its own views. The Bio page auto-selects the bio
- * mode (EMG / EEG / PPG plot set) per device from DeviceInfo and observed
- * batches - Qt layoutBio parity: 8 single-channel slots, EEG paging
- * (Prev/Next + "Page X / Y"), impedance side texts, and the PPG fixed plot
- * set (EEG fp1/fp2 + PPG red/ir + SpO2 spo2/hr). Every async SDK call goes
- * through the stdlib suspend extensions in SensorCapiAsync.kt (scan /
- * connect / disconnect / init / startDataNotification / setParam / getParam /
- * parseBinToCsvAsync); the listeners (data, state, power, error, device-info
- * update) fire on the binding's callback thread and are marshalled to the UI
- * as needed.
- *
- * Data path ("Clone Data" checkbox, Qt MainWindow parity; runtime
- * switchable, default unchecked). The queue is always there: each
- * SensorData batch is enqueued on the SDK callback thread together with
- * its device mac (bounded, drop-oldest), a daemon worker thread drains
- * the queue through the append path, and a periodic UI timer refreshes
- * the current device's views and the stats label (no per-batch UI work).
- *  - checked  : the batch is clone()d before enqueueing, so the queue
- *               carries owned data;
- *  - unchecked: the borrowed batch is enqueued directly - its sample and
- *               info buffers stay readable until teardown; a batch
- *               rewritten before the worker reads it is caught by the
- *               isDataValid() probe and reads as zeros.
- */
+// Kotlin sen_capi demo: multi-device scan -> connect -> init -> stream, with
+// Device / Bio / IMU pages and bin replay.
 class MainActivity : Activity() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -158,11 +117,9 @@ class MainActivity : Activity() {
         val inFlight = AtomicBoolean(false)
     }
 
-    /**
-     * One bio slot binding (Qt MainWindow::_bioTargets / setSource parity):
-     * a slot view fed from channel `channel` of the `dataType` stream, with
-     * an optional impedance side-text target (impKind < 0 = none).
-     */
+    // One bio slot binding: a slot view fed from channel `channel` of the
+    // `dataType` stream, with an optional impedance side-text target
+    // (impKind < 0 = none).
     private data class BioFeed(
         val view: WaveformView,
         val dataType: Int,
@@ -171,18 +128,9 @@ class MainActivity : Activity() {
         val impChannel: Int = 0,
     )
 
-    /**
-     * Per-device UI and data state (Qt DeviceState parity), keyed by mac in
-     * deviceStates. Owns the device's Bio/IMU page contents (built once on
-     * the UI thread at registration and swapped into the page containers
-     * when the device becomes current), the bio mode detection data, the
-     * per-device Live Filter, the data counters plus the per-type rate/loss
-     * accounting for the stats labels, the impedance side-text values, the
-     * gesture readout, and the last DeviceInfo / battery reading used to
-     * rebind the Device page labels on a switch.
-     * `profile` is null only for a state whose link is already torn down;
-     * replay sessions get a state too (isReplay), keyed by the bin's mac.
-     */
+    // Per-device UI and data state, keyed by mac in deviceStates. `profile`
+    // is null only for a state whose link is already torn down; replay
+    // sessions get a state too (isReplay), keyed by the bin's mac.
     private inner class DeviceUiState(
         val mac: String,
         val profile: SensorProfile?,
@@ -191,23 +139,17 @@ class MainActivity : Activity() {
         var info: DeviceInfo? = null
         var lastPower = -1
 
-        // Driven by the SDK's data-transfer state notification (authoritative,
-        // covers auto-reconnect stream restores and replay start/EOF): true
-        // while the stream is actually on.
+        // True while the stream is on.
         @Volatile var transferring = false
 
-        // Bio mode detection: observed dataType -> channelCount. bioFeeds
-        // binds the 8 bio slots to (dataType, channel) sources; the list
-        // reference is replaced atomically on re-layout so the data worker
-        // thread never sees a half-built binding.
+        // Bio mode detection: observed dataType -> channelCount.
         val bioChannels = HashMap<Int, Int>()
         @Volatile var bioMode = BioMode.NONE
         @Volatile var bioFeeds: List<BioFeed> = emptyList()
-        // Current binding of each bio slot (null = unbound); a slot re-bound
-        // to a different source drops its ring content.
+        // Current binding of each bio slot (null = unbound).
         val slotFeeds = arrayOfNulls<BioFeed>(BIO_SLOT_COUNT)
         // Current EEG page (0-based) and the channel counts the current bio
-        // layout was built from (a page flip re-layouts with the same counts).
+        // layout was built from.
         var bioPageIndex = 0
         var lastBioCounts = IntArray(6) // eeg, ecg, brth, ppg, spo2, emg
 
@@ -218,9 +160,7 @@ class MainActivity : Activity() {
         var lastLogMs = 0L
         val diagTypes = java.util.Collections.synchronizedSet(java.util.HashSet<Int>())
 
-        // Per-type accounting for the stats/rate labels (Qt DeviceState
-        // rateCounts/lostCounts parity): written on the data thread under
-        // rateLock, read on the UI thread.
+        // Per-type accounting for the stats/rate labels.
         val rateLock = Any()
         val rateCounts = HashMap<Int, Long>()      // valid samples in the current window
         val actualRates = HashMap<Int, Double>()   // rotated once per second
@@ -230,10 +170,8 @@ class MainActivity : Activity() {
         val typeBatches = HashMap<Int, Long>()
         var rateWindowStartMs = System.currentTimeMillis()
 
-        /**
-         * Rotates the accumulated per-type sample counts into actualRates
-         * (Qt DeviceState::updateActualRates parity); call once per second.
-         */
+        // Rotates the accumulated per-type sample counts into actualRates;
+        // call once per second.
         fun updateActualRates() {
             val now = System.currentTimeMillis()
             synchronized(rateLock) {
@@ -250,25 +188,21 @@ class MainActivity : Activity() {
         @Volatile var streamStartTimeSec = 0.0
         @Volatile var streamDelayMs = 0
 
-        // Latest impedance per channel (ohms; -1 = unknown), by IMP_* kind;
-        // written on the data thread under impLock, read on the UI thread.
+        // Latest impedance per channel (ohms; -1 = unknown), by IMP_* kind.
         val impLock = Any()
         val impedances = arrayOf(
             ArrayList<Float>(), ArrayList<Float>(), ArrayList<Float>(), ArrayList<Float>())
 
-        // Latest gesture readout (Qt DeviceState gesture fields parity);
-        // -1 = nothing received yet.
+        // Latest gesture readout; -1 = nothing received yet.
         @Volatile var gesture = -1
         @Volatile var rawGesture = -1
         @Volatile var possibility = -1
         @Volatile var strength = -1
 
-        // Per-device bio live filter; the spinner band is applied at
-        // registration and re-applied to every state on a band switch.
+        // Per-device bio live filter.
         val liveFilter = LiveFilter()
 
-        // Bumped on every clearDataViews so an in-flight spectrum result
-        // from the old session is dropped.
+        // Bumped on every clearDataViews.
         @Volatile var dataSession = 0
 
         // Page contents (see buildStateViews).
@@ -290,18 +224,14 @@ class MainActivity : Activity() {
     }
 
     // Connected/streaming devices plus at most one replay state, keyed by
-    // mac. Structural changes happen on the UI thread; data-thread lookups
-    // synchronize on the map.
+    // mac.
     private val deviceStates = LinkedHashMap<String, DeviceUiState>()
 
     // The device whose pages are shown and whose profile the setParam
-    // controls target (Qt "current device" parity); null when nothing is
-    // connected.
+    // controls target; null when nothing is connected.
     @Volatile private var currentMac: String? = null
 
-    // Bin replay state: the replay profile is a replay-mode profile returned
-    // by replayBinFile; replayMac is the mac the replay session was started
-    // with (stopBinReplay is keyed by it) and keys the replay DeviceUiState.
+    // Bin replay state; replayMac keys the replay DeviceUiState.
     private var replayProfile: SensorProfile? = null
     private var replayMac: String? = null
 
@@ -311,15 +241,11 @@ class MainActivity : Activity() {
     private lateinit var bioPageContainer: FrameLayout
     private lateinit var imuPageContainer: FrameLayout
 
-    // Live Filter band spinner selection (Bio page): an activity-level UI
-    // choice applied to every device state's filter (Python demo
-    // _filter_band parity).
+    // Live Filter band spinner selection (Bio page).
     private var filterBand = 0
     private lateinit var filterSpinner: Spinner
 
-    // The spectrum FFT runs on a shared single-thread executor, throttled
-    // per strip; a result computed from a superseded data session or ring
-    // generation is dropped.
+    // Spectrum worker.
     private val fftExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "SpectrumWorker").apply { isDaemon = true }
     }
@@ -334,12 +260,11 @@ class MainActivity : Activity() {
     private lateinit var mtuText: TextView
     private lateinit var selectedText: TextView
     private lateinit var statsText: TextView
+    private lateinit var sdkText: TextView
     private lateinit var gestureText: TextView
     private lateinit var deviceListView: ListView
     private lateinit var listAdapter: ArrayAdapter<String>
-    // Mac of each visible list row, in row order (scan entries, then the
-    // synthetic state-only rows); rebuilt by refreshDeviceList and read by
-    // the adapter to tint the selected row.
+    // Mac of each visible list row, in row order.
     private var rowMacs: List<String> = emptyList()
     private lateinit var cloneCheck: CheckBox
     private lateinit var autoReconnectCheck: CheckBox
@@ -354,9 +279,7 @@ class MainActivity : Activity() {
     private val ntfChecks = LinkedHashMap<String, CheckBox>()
     private val filterChecks = LinkedHashMap<String, CheckBox>()
 
-    // Bio page widgets (EEG paging, Qt MainWindow::_pageControls parity):
-    // visible only for the current device in EEG mode with more than one
-    // page.
+    // Bio page widgets (EEG paging).
     private lateinit var pageControlsRow: LinearLayout
     private lateinit var prevPageBtn: Button
     private lateinit var nextPageBtn: Button
@@ -371,31 +294,23 @@ class MainActivity : Activity() {
     private var suppressNtfCallbacks = false
     private var suppressSampleRateCallbacks = false
 
-    // Session-wide toggles (Qt MainWindow parity): auto reconnect applies to
-    // every connected device and is inherited by new connections; the debug
-    // toggles gate the SDK file logging and the per-device bin recording.
+    // Session-wide toggles.
     private var autoReconnect = true
     private var debugLogEnabled = true
     private var binDataEnabled = true
     private var replayPaused = false
     private var analyzing = false
 
-    // Last 1 Hz rotation of the per-type rate windows (UI timer driven).
+    // Last 1 Hz rotation of the per-type rate windows.
     private var lastRateTickMs = 0L
 
-    // Data queue (always on): the SDK callback thread only enqueues
-    // (mac + batch) -- an owned clone when Clone Data is checked, the
-    // borrowed batch otherwise; a daemon worker drains the queue, and the
-    // UI timer below refreshes the views, so neither the SDK thread nor
-    // the UI thread does the per-batch processing.
+    // Data queue (mac + batch) drained by the data worker.
     private class QueuedBatch(val mac: String, val data: SensorData)
     private val dataQueue = ArrayBlockingQueue<QueuedBatch>(DATA_QUEUE_CAPACITY)
     private val dataWorkerStop = AtomicBoolean(false)
     private var dataWorker: Thread? = null
 
-    // Periodic UI refresh: redraws the current device's views from their
-    // rings and updates the stats labels; the impedance side texts and the
-    // 1 Hz rate-window rotation run here too.
+    // Periodic UI refresh.
     private val uiRefreshTimer = object : Runnable {
         override fun run() {
             val st = currentState()
@@ -423,7 +338,6 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        title = "SensorCapiKtDemo v$DEMO_VERSION"
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(buildTabBar(), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
@@ -438,12 +352,10 @@ class MainActivity : Activity() {
         mainHandler.postDelayed(uiRefreshTimer, UI_REFRESH_INTERVAL_MS)
 
         controller = SensorController.getInstance()
-        // Python demo parity (_apply_sdk_debug_log): session logs and bin
-        // exports go into a "<yyyyMMdd_HHmmss>_<sdk version>" subdir of the
-        // SDK log base dir; the path must be set BEFORE setDebugEnabled(true),
-        // and both must precede registerBleBridge -- the bridge registration
-        // already emits SDK log records, which would otherwise open the
-        // controller log at the default base dir.
+        title = "SensorCapiKtDemo v$DEMO_VERSION (SDK ${controller.version})"
+        sdkText.text = "SDK: ${controller.version}"
+        // Session log dir: set before enabling the debug log and registering
+        // the BLE bridge.
         if (debugLogEnabled) {
             applySdkDebugLog()
         }
@@ -497,6 +409,7 @@ class MainActivity : Activity() {
         page.addView(btnRow)
 
         statusText = TextView(this).apply { textSize = 13f }
+        sdkText = TextView(this).apply { textSize = 13f }
         rateText = TextView(this).apply { textSize = 13f }
         batteryText = TextView(this).apply { textSize = 13f; text = "Battery: -" }
         linkText = TextView(this).apply { textSize = 13f; text = "Link: --" }
@@ -504,6 +417,7 @@ class MainActivity : Activity() {
         selectedText = TextView(this).apply { textSize = 13f; text = "Selected: -" }
         statsText = TextView(this).apply { textSize = 13f; text = "Batches: 0 (lost pkgs: 0)" }
         page.addView(statusText)
+        page.addView(sdkText)
         page.addView(rateText)
         page.addView(batteryText)
         page.addView(linkText)
@@ -511,17 +425,13 @@ class MainActivity : Activity() {
         page.addView(selectedText)
         page.addView(statsText)
 
-        // Device list: each row shows the connection state and which device
-        // is currently displayed ("<- showing" mark), and the SELECTED row
-        // (Connect/Disconnect target) carries a subtle background tint.
-        // Tapping a row selects it; tapping a connected row also makes it the
-        // current device whose data the Bio/IMU pages show (Qt demo parity).
+        // Device list: tapping a row selects it; tapping a connected row
+        // also makes it the current device whose data the Bio/IMU pages show.
         listAdapter = object : ArrayAdapter<String>(this,
                 android.R.layout.simple_list_item_1, ArrayList()) {
             override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                 val v = super.getView(position, convertView, parent)
                 val mac = rowMacs.getOrNull(position)
-                // Recycled views: set the background in both branches.
                 v.setBackgroundColor(
                     if (mac != null && mac == selectedMac) ROW_SELECTED_BG else ROW_DEFAULT_BG)
                 return v
@@ -530,15 +440,11 @@ class MainActivity : Activity() {
         deviceListView = ListView(this).apply {
             adapter = listAdapter
             setOnItemClickListener { _, _, position, _ ->
-                // Rows past the scan list are state-only entries (replay of
-                // an off-air device's bin); they have no BleDevice.
+                // Rows past the scan list are state-only entries (bin replay).
                 val mac = rowMacs.getOrNull(position) ?: return@setOnItemClickListener
                 val d = sortedDevices.getOrNull(position)
                 selectedMac = mac
                 selectedText.text = "Selected: ${d?.name ?: "replay"} [$mac]"
-                // Move the row highlight immediately (a current-device switch
-                // below also rebuilds the list, but a plain selection of an
-                // unconnected row does not).
                 listAdapter.notifyDataSetChanged()
                 synchronized(deviceStates) {
                     if (deviceStates.containsKey(mac) && mac != currentMac) {
@@ -548,13 +454,10 @@ class MainActivity : Activity() {
                 updateConnectButton()
             }
         }
-        // Fixed height: the merged settings controls below stay reachable and
-        // the whole page scrolls (Qt mobile layout parity).
+        // Fixed height: the page scrolls.
         page.addView(deviceListView, LinearLayout.LayoutParams(MATCH_PARENT, dp(150)))
 
-        // Clone Data (Qt MainWindow parity), default OFF: checked = every
-        // batch is clone()d before entering the data queue; unchecked =
-        // zero-copy, the queue carries the borrowed batch.
+        // Clone Data checkbox, default OFF.
         cloneCheck = CheckBox(this).apply {
             text = "Clone Data"
             isChecked = false
@@ -562,8 +465,7 @@ class MainActivity : Activity() {
         }
         page.addView(cloneCheck)
 
-        // Auto Reconnect (Qt MainWindow parity): default ON; applies to every
-        // connected device and is inherited by new connections.
+        // Auto Reconnect checkbox, default ON.
         autoReconnectCheck = CheckBox(this).apply {
             text = "Auto Reconnect"
             isChecked = true
@@ -571,8 +473,8 @@ class MainActivity : Activity() {
         }
         page.addView(autoReconnectCheck)
 
-        // Debug log toggles (Qt "Debug Log" group parity), both default ON.
-        val debugRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        // Debug log toggles, both default ON.
+        val debugRow = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         debugLogCheck = CheckBox(this).apply {
             text = "Enable SDK Debug Log"
             isChecked = true
@@ -583,12 +485,11 @@ class MainActivity : Activity() {
             isChecked = true
             setOnCheckedChangeListener { _, isChecked -> onBinDataToggled(isChecked) }
         }
-        debugRow.addView(debugLogCheck, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        debugRow.addView(binDataCheck, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        debugRow.addView(debugLogCheck)
+        debugRow.addView(binDataCheck)
         page.addView(debugRow)
 
-        // NTF switches (Qt demo setParam panel parity); they target the
-        // current device and are re-synced on every current-device switch.
+        // NTF switches targeting the current device.
         val ntfKeys = listOf("NTF_EEG", "NTF_EMG", "NTF_GEST", "NTF_PPG", "NTF_SPO2", "NTF_IMU")
         val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         var row: LinearLayout? = null
@@ -599,8 +500,6 @@ class MainActivity : Activity() {
             }
             val cb = CheckBox(this).apply {
                 text = key
-                // Enabled by syncSwitches() once a device is initialized;
-                // before that a tap would flip the box without any effect.
                 isEnabled = false
                 setOnCheckedChangeListener { _, isChecked -> onNtfToggled(key, isChecked) }
             }
@@ -609,10 +508,7 @@ class MainActivity : Activity() {
         }
         page.addView(grid)
 
-        // FILTER switches (Qt "Filter" group parity): same readback pattern
-        // as the NTF switches, but capability comes from the FILTER aggregate
-        // query alone - old EMG devices answer it with an error, so the boxes
-        // stay disabled (never hidden).
+        // FILTER switches targeting the current device.
         val filterKeys = listOf("FILTER_50HZ", "FILTER_60HZ", "FILTER_HPF", "FILTER_LPF")
         val filterRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         for (key in filterKeys) {
@@ -626,10 +522,7 @@ class MainActivity : Activity() {
         }
         page.addView(filterRow)
 
-        // EEG sample rate options (Qt demo "EEG Sample Rate" group parity):
-        // enabled per getParam("EEG_SAMPLE_RATE_LIST"), checked per
-        // getParam("EEG_SAMPLE_RATE"); a user selection issues setParam on
-        // the current device and re-syncs the buttons (syncSampleRateControl).
+        // EEG sample rate options.
         val srRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val srLabel = TextView(this).apply {
             text = "EEG Sample Rate"
@@ -651,22 +544,17 @@ class MainActivity : Activity() {
         srRow.addView(sampleRateGroup)
         page.addView(srRow)
 
-        // Gesture readout (Qt "Gesture" group parity); follows the current
-        // device, refreshed by the UI timer.
+        // Gesture readout.
         gestureText = TextView(this).apply {
             textSize = 13f
             text = GESTURE_EMPTY_TEXT
         }
         page.addView(gestureText)
 
-        // Bin replay section: the replay profile gets its own DeviceUiState
-        // (keyed by the bin's mac) and becomes the current device while it
-        // runs; live devices keep streaming in the background.
+        // Bin replay section.
         replayPathEdit = EditText(this).apply {
             setSingleLine()
-            // Default to the app-private external files dir: on Android 11+
-            // (scoped storage) the demo holds no broad storage permission, so
-            // arbitrary /sdcard paths are unreadable; adb push still works:
+            // Default to the app-private external files dir:
             //   adb push test.bin /sdcard/Android/data/<package>/files/
             setText("${getExternalFilesDir(null)}/test.bin")
         }
@@ -694,18 +582,14 @@ class MainActivity : Activity() {
         replayRow.addView(stopReplayBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         replayRow.addView(analyzeBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         page.addView(replayRow)
-        // The merged device + settings controls can exceed a phone screen;
-        // wrap the page in a ScrollView (Qt mobile QScrollArea parity).
+        // The page scrolls.
         return ScrollView(this).apply { addView(page) }
     }
 
     private fun buildWaveformPage(): View {
         val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // Live Filter band spinner (Qt demo filter combo parity): band-passes
-        // the bio waveforms (EMG/EEG/ECG/BRTH/PPG/SpO2) on the data thread
-        // before they reach the display rings. The band is a UI choice shared
-        // by every device; each device state applies it to its own filter.
+        // Live Filter band spinner.
         val filterRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(8), dp(4), dp(8), 0)
@@ -737,9 +621,7 @@ class MainActivity : Activity() {
         filterRow.addView(filterSpinner, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         page.addView(filterRow)
 
-        // EEG paging controls (Qt MainWindow::_pageControls parity): visible
-        // only when the current device is in EEG mode with more than one
-        // page; the page state is per device (DeviceUiState.bioPageIndex).
+        // EEG paging controls.
         pageControlsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(8), 0, dp(8), 0)
@@ -778,7 +660,7 @@ class MainActivity : Activity() {
         return imuPageContainer
     }
 
-    /** Centered-ish placeholder text shown while a page has no current device. */
+    // Placeholder text shown while a page has no current device.
     private fun showPagePlaceholder(container: FrameLayout, text: String) {
         container.removeAllViews()
         val tv = TextView(this).apply {
@@ -796,18 +678,7 @@ class MainActivity : Activity() {
         return synchronized(deviceStates) { deviceStates[mac] }
     }
 
-    /**
-     * Builds one device state's Bio/IMU page contents. The Bio content is a
-     * header plus 8 single-channel waveform slots (Qt MainWindow::_bioWidgets
-     * parity) which layoutBio binds to (stream, channel) sources - paging an
-     * EEG device re-binds the slots, the views themselves persist. The IMU
-     * content is a weight-split layout (no ScrollView): each waveform view
-     * (ACC/GYRO/EULER/QUATERNION) gets ~1/4 of the height, so the per-channel
-     * row height stays large on phone screens, and a spectrum strip (FFT of
-     * the waveform above it, computed on the spectrum worker) sits under each
-     * waveform at a smaller weight - plus the 3D quaternion cube. Must run on
-     * the UI thread.
-     */
+    // Builds one device state's Bio/IMU page contents.
     private fun buildStateViews(st: DeviceUiState) {
         st.bioPage = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         st.bioHeader = TextView(this).apply {
@@ -825,14 +696,26 @@ class MainActivity : Activity() {
         showBioPlaceholder(st, "Waiting for data ...")
 
         st.imuPage = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        st.accView = WaveformView(this, viewChannels = 3, capacity = 500).apply { title = "ACC" }
-        st.gyroView = WaveformView(this, viewChannels = 3, capacity = 500).apply { title = "GYRO" }
-        st.eulerView = WaveformView(this, viewChannels = 3, capacity = 500).apply { title = "EULER (deg)" }
-        st.quatView = WaveformView(this, viewChannels = 4, capacity = 500).apply { title = "QUATERNION" }
-        st.accSpectrum = SpectrumView(this)
-        st.gyroSpectrum = SpectrumView(this)
-        st.eulerSpectrum = SpectrumView(this)
-        st.quatSpectrum = SpectrumView(this)
+        val accLabels = arrayOf("ACC-X", "ACC-Y", "ACC-Z")
+        val gyroLabels = arrayOf("GYRO-X", "GYRO-Y", "GYRO-Z")
+        val eulerLabels = arrayOf("Pitch(Y)", "Roll(X)", "Yaw(Z)")
+        val quatLabels = arrayOf("W", "X", "Y", "Z")
+        st.accView = WaveformView(this, viewChannels = 3, capacity = 500).apply {
+            title = "ACC"; labels = accLabels
+        }
+        st.gyroView = WaveformView(this, viewChannels = 3, capacity = 500).apply {
+            title = "GYRO"; labels = gyroLabels
+        }
+        st.eulerView = WaveformView(this, viewChannels = 3, capacity = 500).apply {
+            title = "EULER (deg)"; labels = eulerLabels
+        }
+        st.quatView = WaveformView(this, viewChannels = 4, capacity = 500).apply {
+            title = "QUATERNION"; labels = quatLabels
+        }
+        st.accSpectrum = SpectrumView(this).apply { labels = accLabels }
+        st.gyroSpectrum = SpectrumView(this).apply { labels = gyroLabels }
+        st.eulerSpectrum = SpectrumView(this).apply { labels = eulerLabels }
+        st.quatSpectrum = SpectrumView(this).apply { labels = quatLabels }
         st.cubeView = CubeView(this)
         st.imuPage.addView(st.accView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         st.imuPage.addView(st.accSpectrum, LinearLayout.LayoutParams(MATCH_PARENT, 0, 0.5f))
@@ -851,10 +734,7 @@ class MainActivity : Activity() {
         )
     }
 
-    /**
-     * Registers a device (live or replay) and builds its page contents.
-     * Must run on the UI thread. Applies the current Live Filter band.
-     */
+    // Registers a device (live or replay) and builds its page contents.
     private fun registerDeviceState(mac: String, profile: SensorProfile?,
                                     isReplay: Boolean): DeviceUiState {
         val st = DeviceUiState(mac, profile, isReplay)
@@ -865,11 +745,7 @@ class MainActivity : Activity() {
         return st
     }
 
-    /**
-     * Drops a device state (disconnect / replay end): removes its page
-     * contents and, when it was the current device, switches the pages to
-     * another remaining device (or the placeholder). UI thread.
-     */
+    // Drops a device state (disconnect / replay end).
     private fun removeDeviceState(mac: String) {
         val st = synchronized(deviceStates) { deviceStates.remove(mac) } ?: return
         bioPageContainer.removeView(st.bioPage)
@@ -882,13 +758,9 @@ class MainActivity : Activity() {
         updateConnectButton()
     }
 
-    /**
-     * Makes a device the current one (Qt current-device parity): its page
-     * contents are swapped into the Bio/IMU page containers, the Device
-     * page labels (battery/link/MTU/stats) rebind to its state, and the
-     * NTF/sample-rate controls re-sync from its profile (greyed out for a
-     * replay state or when nothing is current). UI thread.
-     */
+    // Makes a device the current one: its page contents are swapped into the
+    // Bio/IMU page containers and the Device page controls re-sync from its
+    // profile.
     private fun setCurrentDevice(mac: String?) {
         currentMac = mac
         bioPageContainer.removeAllViews()
@@ -911,8 +783,7 @@ class MainActivity : Activity() {
                 mtuText.text = "MTU: --"
             }
             if (st.isReplay) {
-                // No parameter control over a replay session; the sample
-                // rate radios only mirror the capture's rate (checked state).
+                // No parameter control over a replay session.
                 greyOutControls()
                 syncSampleRateChecked(st.info?.eegSampleRate ?: 0f)
             } else if (st.profile != null) {
@@ -926,14 +797,13 @@ class MainActivity : Activity() {
         Log.i(TAG, "current device -> ${mac ?: "-"}")
     }
 
-    /** Greys the per-device setParam controls (disconnect / replay / none). */
+    // Greys the per-device setParam controls (disconnect / replay / none).
     private fun greyOutControls() {
         suppressNtfCallbacks = true
         for (cb in ntfChecks.values) {
             cb.isEnabled = false
             cb.isChecked = false
         }
-        // Filter boxes are never hidden, only disabled + unchecked.
         for (cb in filterChecks.values) {
             cb.isEnabled = false
             cb.isChecked = false
@@ -947,7 +817,7 @@ class MainActivity : Activity() {
         suppressSampleRateCallbacks = false
     }
 
-    /** Idle state of one device's bio page: all slots unbound, placeholder. */
+    // Idle state of one device's bio page: all slots unbound, placeholder.
     private fun showBioPlaceholder(st: DeviceUiState, text: String) {
         st.bioMode = BioMode.NONE
         st.bioFeeds = emptyList()
@@ -959,12 +829,7 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Binds one bio slot to a (stream, channel) source (Qt
-     * WaveformWidget::setSource parity): label, curve color (stable per real
-     * channel across EEG pages), and the impedance side-text target. A slot
-     * re-bound to a different source drops its ring content.
-     */
+    // Binds one bio slot to a (stream, channel) source.
     private fun bindSlot(st: DeviceUiState, slot: Int, dataType: Int, channel: Int,
                          label: String, colorIndex: Int, impKind: Int,
                          feeds: MutableList<BioFeed>) {
@@ -979,7 +844,7 @@ class MainActivity : Activity() {
         feeds.add(feed)
     }
 
-    /** Unbinds one bio slot (Qt setSource(nullptr) parity). */
+    // Unbinds one bio slot.
     private fun unbindSlot(st: DeviceUiState, slot: Int, placeholder: String) {
         val v = st.bioSlots[slot]
         st.slotFeeds[slot] = null
@@ -989,16 +854,7 @@ class MainActivity : Activity() {
         v.sideText = ""
     }
 
-    /**
-     * Re-layouts one device's bio slots for one mode (Qt MainWindow::layoutBio
-     * parity): 8 single-channel slots. EMG mode fills the leading slots with
-     * the EMG channels (no paging). EEG mode pages the EEG channels with
-     * perPage = 8 - hasECG - hasBRTH channels per page; the ECG slot is the
-     * last widget (second-to-last when BRTH follows), BRTH the last. PPG mode
-     * is the fixed 6-plot set (EEG fp1/fp2 + PPG red/ir + SpO2 spo2/hr); the
-     * two EEG plots carry impedance side texts. Must run on the UI thread.
-     * Channel counts come from DeviceInfo or observed batches; 0 = absent.
-     */
+    // Re-layouts one device's bio slots for one mode.
     private fun layoutBio(st: DeviceUiState, mode: BioMode, eegCh: Int, ecgCh: Int,
                           brthCh: Int, ppgCh: Int, spo2Ch: Int, emgCh: Int) {
         st.bioMode = mode
@@ -1032,25 +888,21 @@ class MainActivity : Activity() {
                 for (i in 0 until BIO_SLOT_COUNT) {
                     val ch = startCh + i
                     if (i < perPage && ch < eegCh) {
-                        // The real channel index drives the curve color so it
-                        // stays stable across pages.
                         bindSlot(st, i, DataType.NTF_EEG, ch, "EEG-${ch + 1}", ch, IMP_EEG, feeds)
                     } else if (hasECG && i == ecgIndex) {
                         bindSlot(st, i, DataType.NTF_ECG, 0, "ECG", -1, IMP_ECG, feeds)
                     } else if (hasBRTH && i == brthIndex) {
                         bindSlot(st, i, DataType.NTF_BRTH, 0, "BRTH", -1, IMP_BRTH, feeds)
                     } else {
-                        // Slots past the last EEG channel on the final page
-                        // stay blank (Python hides those axes).
+                        // Slots past the last EEG channel stay blank.
                         val noSuchChannel = i < perPage && ch >= eegCh
                         unbindSlot(st, i, if (noSuchChannel) "" else waiting)
                     }
                 }
             }
             BioMode.PPG -> {
-                // Fixed plot set (DemoNewMulti BIO_PLOT_CONFIG): EEG fp1/fp2 +
-                // PPG red/ir led + SpO2 spo2/heart_rate; the slot index drives
-                // the curve color so each plot gets its own.
+                // Fixed plot set: EEG fp1/fp2 + PPG red/ir led + SpO2
+                // spo2/heart_rate.
                 st.bioHeader.text = "EEG + PPG + SpO2 Waveform"
                 val plots = arrayOf(
                     intArrayOf(DataType.NTF_EEG, 0), intArrayOf(DataType.NTF_EEG, 1),
@@ -1087,13 +939,13 @@ class MainActivity : Activity() {
         updatePageControls()
     }
 
-    /** EEG page count for the given per-page size and channel total. */
+    // EEG page count for the given per-page size and channel total.
     private fun bioPageCount(perPage: Int, total: Int): Int {
         if (perPage <= 0 || total <= 0) return 1
         return maxOf(1, (total + perPage - 1) / perPage)
     }
 
-    /** Page count of a device state (1 outside EEG mode). */
+    // Page count of a device state (1 outside EEG mode).
     private fun bioPageCount(st: DeviceUiState?): Int {
         if (st == null || st.bioMode != BioMode.EEG) return 1
         val c = st.lastBioCounts
@@ -1101,8 +953,7 @@ class MainActivity : Activity() {
         return bioPageCount(perPage, c[0])
     }
 
-    /** Syncs the Bio page paging row with the current device (Qt
-     * updatePageControls parity): visible only in EEG mode with > 1 page. */
+    // Syncs the Bio page paging row with the current device.
     private fun updatePageControls() {
         val st = currentState()
         val pages = bioPageCount(st)
@@ -1112,7 +963,7 @@ class MainActivity : Activity() {
         nextPageBtn.isEnabled = (st?.bioPageIndex ?: 0) < pages - 1
     }
 
-    /** Prev/Next page: re-layouts the current device's EEG slots in place. */
+    // Prev/Next page.
     private fun onBioPage(delta: Int) {
         val st = currentState() ?: return
         if (st.bioMode != BioMode.EEG) return
@@ -1125,7 +976,7 @@ class MainActivity : Activity() {
         layoutBio(st, BioMode.EEG, c[0], c[1], c[2], c[3], c[4], c[5])
     }
 
-    /** Mode from DeviceInfo (Qt DeviceState::bioKind parity: PPG > EEG > EMG). */
+    // Mode from DeviceInfo (PPG > EEG > EMG).
     private fun detectBioMode(info: DeviceInfo): BioMode = when {
         info.ppgSampleRate > 0 || info.ppgChannelCount > 0 -> BioMode.PPG
         info.eegChannelCount > 0 -> BioMode.EEG
@@ -1133,15 +984,8 @@ class MainActivity : Activity() {
         else -> BioMode.NONE
     }
 
-    /**
-     * Data-driven fallback/repair of one device's bio mode: records the
-     * batch's channel count, then re-layouts the slots when the observed
-     * types imply a different mode (PPG wins over EEG/EMG once a PPG/SPO2
-     * batch arrives), when a stream's channel count changed, or when an
-     * EEG-mode ECG/BRTH slot shows up that has no bound slot yet. Safe to
-     * call from any thread; the re-layout itself is marshalled to the UI
-     * thread.
-     */
+    // Data-driven fallback/repair of one device's bio mode from observed
+    // batches.
     private fun maybeReconfigureBio(st: DeviceUiState, d: SensorData) {
         val t = d.dataType
         if (t != DataType.NTF_EMG && t != DataType.NTF_EEG && t != DataType.NTF_ECG &&
@@ -1179,21 +1023,14 @@ class MainActivity : Activity() {
         if (Looper.myLooper() == Looper.getMainLooper()) rebuild.run() else mainHandler.post(rebuild)
     }
 
-    /** Back to the mode-less placeholder (per device). */
+    // Back to the mode-less placeholder (per device).
     private fun resetBio(st: DeviceUiState) {
         synchronized(st.bioChannels) { st.bioChannels.clear() }
         showBioPlaceholder(st, "Waiting for data ...")
     }
 
-    /**
-     * FFT spectra of the current device's IMU waveforms (Qt demo
-     * maybeSubmitFft/pollFftResult parity): the time-ordered ring snapshot
-     * is computed on the shared worker executor so neither the UI thread nor
-     * the data thread runs the FFT; throttled to one compute per strip every
-     * FFT_UPDATE_INTERVAL_MS with a single in-flight task per strip. Results
-     * whose data session or ring generation changed while computing are
-     * dropped. Called from the UI refresh timer (both data path modes).
-     */
+    // FFT spectra of the current device's IMU waveforms, computed on the
+    // worker executor.
     private fun maybeSubmitSpectra() {
         val st = currentState() ?: return
         val now = System.currentTimeMillis()
@@ -1222,7 +1059,6 @@ class MainActivity : Activity() {
                     }
                 }
             } catch (e: RejectedExecutionException) {
-                // Executor already shut down (activity teardown).
                 feed.inFlight.set(false)
             }
         }
@@ -1236,9 +1072,6 @@ class MainActivity : Activity() {
         } else {
             listOf(Manifest.permission.ACCESS_FINE_LOCATION)
         } + if (Build.VERSION.SDK_INT <= 28) {
-            // Runtime /sdcard access for bin replay and the SDK log dir
-            // (/sdcard/Documents/sensorsdklog); granting WRITE also grants READ
-            // in the same permission group.
             listOf(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         } else {
             emptyList()
@@ -1251,12 +1084,8 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Android 11+ scoped storage blocks raw /sdcard access; all-files access
-     * is granted by the user on a system settings page (there is no runtime
-     * dialog). Needed for the SDK session logs and the .bin export under
-     * /sdcard/Documents/sensorsdklog.
-     */
+    // All-files access for the SDK session logs and the .bin export under
+    // /sdcard/Documents/sensorsdklog.
     private fun requestStorageAccess() {
         if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) {
             return
@@ -1284,8 +1113,7 @@ class MainActivity : Activity() {
             scanBtn.text = "Stop Scan"
             setStatus("Scanning ...")
             scope.launch {
-                // Repeated scan() rounds: each round scans 5 s, then stops and
-                // returns the MAC-deduplicated list (Python scan parity).
+                // Repeated scan() rounds.
                 while (scanning) {
                     if (!controller.isEnable) {
                         appLog("User: start scan rejected (Bluetooth disabled)", "W")
@@ -1311,11 +1139,7 @@ class MainActivity : Activity() {
         setStatus("Devices: ${sortedDevices.size}")
     }
 
-    /**
-     * Rebuilds the list rows: name/mac/rssi plus the connection state and a
-     * "<- showing" mark on the current device (Qt demo current-device
-     * display parity).
-     */
+    // Rebuilds the list rows.
     private fun refreshDeviceList() {
         listAdapter.clear()
         listAdapter.addAll(sortedDevices.map { d ->
@@ -1332,9 +1156,7 @@ class MainActivity : Activity() {
                 if (d.mac == currentMac) append("  <- showing")
             }
         })
-        // States without a scan-list entry (a replay of an off-air device's
-        // bin): appended so the [replay] row and the "<- showing" mark are
-        // visible; tapping one selects it as the connect target is moot.
+        // States without a scan-list entry (bin replay).
         val scanned = sortedDevices.map { it.mac }.toSet()
         val extra = synchronized(deviceStates) {
             deviceStates.values.filter { it.mac !in scanned }
@@ -1346,20 +1168,14 @@ class MainActivity : Activity() {
                 if (st.mac == currentMac) append("  <- showing")
             }
         })
-        // Row order mirrors the adapter rows; the adapter tints the row whose
-        // mac is the selection. A removed state (disconnect / replay end)
-        // drops its row, which also clears the highlight when it was selected.
         rowMacs = sortedDevices.map { it.mac } + extra.map { it.mac }
         listAdapter.notifyDataSetChanged()
     }
 
     // ---- connect / init / stream (all suspend extensions) ----------------------
 
-    /**
-     * Connects the selected device (without dropping any already-connected
-     * device) or, when the selected device is already linked, disconnects
-     * just that one (Qt demo per-device connect parity).
-     */
+    // Connects the selected device or, when it is already linked,
+    // disconnects just that one.
     private fun toggleConnect() {
         val mac = selectedMac
         if (mac == null) {
@@ -1376,18 +1192,13 @@ class MainActivity : Activity() {
                     setStatus("Disconnecting $mac ...")
                     connectBtn.isEnabled = false
                     appLog("User: disconnect $mac", "I", p0)
-                    // disconnect() stops the running stream first (Python
-                    // parity); the DISCONNECTED state event removes the
-                    // device state and rebinds the UI.
                     p0.disconnect()
                     updateConnectButton()
                 }
                 return
             }
         }
-        // Stop the scan loop before connecting: continuous LOW_LATENCY
-        // scanning during/after connect both gets throttled by the stack
-        // ("scanning too frequently") and can drop the link.
+        // Stop the scan loop before connecting.
         if (scanning) {
             scanning = false
             controller.stopScan()
@@ -1406,8 +1217,7 @@ class MainActivity : Activity() {
                     updateConnectButton()
                     return@launch
                 }
-                // New connections inherit the current Auto Reconnect toggle
-                // (Qt onConnectClicked parity).
+                // New connections inherit the current Auto Reconnect toggle.
                 prof.setAutoReconnect(autoReconnect)
                 val st = registerDeviceState(mac, prof, isReplay = false)
                 attachListeners(st)
@@ -1422,7 +1232,6 @@ class MainActivity : Activity() {
                 setStatus("Connected, init ...")
 
                 // batch 15 samples/channel, 30 s init timeout, battery poll 60 s
-                // (example_android_capi parity).
                 if (!prof.init(15, 30000, 60000)) {
                     appLog("App: failed to initialize ${dev?.name ?: ""} ($mac)", "E", prof)
                     setStatus("Init failed")
@@ -1437,11 +1246,7 @@ class MainActivity : Activity() {
                         "EEG=${info.eegChannelCount}ch@${info.eegSampleRate} ECG=${info.ecgChannelCount} " +
                         "BRTH=${info.brthChannelCount} PPG=${info.ppgChannelCount}ch@${info.ppgSampleRate} " +
                         "SPO2=${info.spo2ChannelCount}ch@${info.spo2SampleRate} IMU=${info.imuChannelCount}ch@${info.imuSampleRate}")
-                // Session params follow the debug toggles (Qt
-                // applySessionParams parity): the per-device log file and the
-                // raw BLE traffic .bin (recorded while streaming, exported
-                // into the session log dir on stream stop) are enabled per
-                // device only while the matching toggle is ON.
+                // Session params follow the debug toggles.
                 if (debugLogEnabled) {
                     val rc = prof.setParam("DEBUG_LOG_PATH", "True")
                     Log.i(TAG, "setParam DEBUG_LOG_PATH=True -> $rc")
@@ -1452,10 +1257,7 @@ class MainActivity : Activity() {
                     Log.i(TAG, "setParam DEBUG_BLE_DATA_PATH=True -> $rc")
                     prof.log("App: setParam(DEBUG_BLE_DATA_PATH, True) -> $rc", "I")
                 }
-                // Bio page mode from DeviceInfo (Qt bioKind parity); seed the
-                // observed-channel map with it so the data-driven repair path
-                // (maybeReconfigureBio) does not transiently downgrade the mode
-                // before the first batch of each type arrives.
+                // Bio page mode from DeviceInfo.
                 synchronized(st.bioChannels) {
                     st.bioChannels.clear()
                     if (info.eegChannelCount > 0) st.bioChannels[DataType.NTF_EEG] = info.eegChannelCount
@@ -1473,8 +1275,7 @@ class MainActivity : Activity() {
                 } else {
                     resetBio(st)
                 }
-                // The just-connected device becomes the current one (Qt demo
-                // parity); the controls re-sync from its profile there.
+                // The just-connected device becomes the current one.
                 setCurrentDevice(mac)
 
                 if (!prof.startDataNotification()) {
@@ -1483,8 +1284,7 @@ class MainActivity : Activity() {
                     updateConnectButton()
                     return@launch
                 }
-                // New data session: clear the device's views and drop any
-                // in-flight spectrum result from a previous session.
+                // New data session: clear the device's views.
                 clearDataViews(st)
                 appLog("App: device connected and streaming: ${dev?.name ?: ""} ($mac)", "I", prof)
                 setStatus("Streaming $mac ...")
@@ -1501,10 +1301,8 @@ class MainActivity : Activity() {
             mainHandler.post {
                 if (newState == DeviceState.DISCONNECTED) {
                     // Single teardown path for user-initiated and abnormal
-                    // drops: removes the state; when it was current, the
-                    // pages switch to another device (controls grey out if
-                    // none remains). The event also fires after a failed
-                    // connect already removed the state; skip the log then.
+                    // drops. The event also fires after a failed connect
+                    // already removed the state; skip the log then.
                     if (synchronized(deviceStates) { deviceStates.containsKey(mac) }) {
                         appLog("App: device disconnected, removed from UI: $mac")
                     }
@@ -1520,9 +1318,8 @@ class MainActivity : Activity() {
             mainHandler.post { if (mac == currentMac) setStatus("Error: $errorMsg") }
         }
         p.setOnPowerListener { _, power ->
-            // Battery stable band (Qt POWER_STABLE_BAND parity): ignore
-            // invalid values, take the first reading directly, and hold the
-            // displayed value while a valid reading differs by less than 4%.
+            // Battery stable band: hold the displayed value while a valid
+            // reading differs by less than POWER_STABLE_BAND.
             if (power < 0) return@setOnPowerListener
             val prev = st.lastPower
             if (prev >= 0 && kotlin.math.abs(power - prev) < POWER_STABLE_BAND) {
@@ -1532,8 +1329,7 @@ class MainActivity : Activity() {
             mainHandler.post { if (mac == currentMac) batteryText.text = "Battery: $power%" }
         }
         p.setOnDeviceInfoUpdateListener { _, info ->
-            // Fired after the cached DeviceInfo changed (e.g. an EEG sample
-            // rate switch); the callback thread is not the UI thread.
+            // Fired after the cached DeviceInfo changed.
             st.info = info
             mainHandler.post {
                 syncSampleRateBuffers(st, info)
@@ -1541,8 +1337,7 @@ class MainActivity : Activity() {
             }
         }
         p.setOnDataTransferStateChangeListener { _, isTransferring ->
-            // Authoritative stream on/off signal (start/stop, link loss,
-            // replay start/EOF); the callback thread is not the UI thread.
+            // Stream on/off signal.
             st.transferring = isTransferring
             appLog("App: data stream ${if (isTransferring) "ON" else "OFF"} $mac", "I", p)
             mainHandler.post { refreshDeviceList() }
@@ -1550,14 +1345,7 @@ class MainActivity : Activity() {
         p.setOnDataListener { _, dataList -> onSensorData(mac, dataList) }
     }
 
-    /**
-     * Data listener entry for live and replay profiles alike: enqueue only.
-     * Clone Data checked = the batch is clone()d on the SDK callback thread
-     * so the queue carries owned data; unchecked = the borrowed batch is
-     * enqueued directly (zero-copy; a stale batch reads as zeros via the
-     * isDataValid() probe downstream). The worker thread drains the queue
-     * through processBatches and the UI timer refreshes the views.
-     */
+    // Data listener entry for live and replay profiles alike: enqueue only.
     private fun onSensorData(mac: String, dataList: List<SensorData>) {
         if (cloneData) {
             for (d in dataList) enqueueData(QueuedBatch(mac, d.clone()))
@@ -1566,19 +1354,14 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Data-queue sink: enqueue only; a full backlog drops the oldest batch. */
+    // Data-queue sink: enqueue only; a full backlog drops the oldest batch.
     private fun enqueueData(q: QueuedBatch) {
         while (!dataQueue.offer(q)) {
             dataQueue.poll()
         }
     }
 
-    /**
-     * Starts the data worker: blocks on the queue and feeds each batch
-     * through the append path. The WaveformView/CubeView append/set methods
-     * take the same locks the UI thread draws under, so the worker never
-     * touches a UI object itself.
-     */
+    // Starts the data worker draining the queue through processBatches.
     private fun startDataWorker() {
         dataWorker = Thread({
             while (!dataWorkerStop.get()) {
@@ -1616,10 +1399,7 @@ class MainActivity : Activity() {
             val result = p.setParam(key, if (on) "ON" else "OFF")
             setStatus("setParam $key=${if (on) "ON" else "OFF"} -> $result")
             appLog("User: setParam($key, ${if (on) "ON" else "OFF"}) -> $result")
-            // Re-query all switches after every toggle: a failed setParam must
-            // revert the box, and coupled keys (the NTF_IMU sub-switches, the
-            // old-device GEST/EMG mutual exclusion) can change as a side
-            // effect (Python demo _refresh_control_states parity).
+            // Re-query all switches after every toggle.
             syncSwitches(p)
         }
     }
@@ -1637,7 +1417,7 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Parses a "K|V|K|V" aggregate answer; empty map on an error string. */
+    // Parses a "K|V|K|V" aggregate answer; empty map on an error string.
     private fun parseAggregate(result: String): Map<String, String> {
         val values = LinkedHashMap<String, String>()
         if (result.startsWith("Error")) return values
@@ -1650,18 +1430,8 @@ class MainActivity : Activity() {
         return values
     }
 
-    /**
-     * Reads back the NTF and FILTER aggregates ("K|V|K|V") and syncs the
-     * boxes after init, after every toggle, and on every current-device
-     * switch (Python demo _refresh_control_states / _apply_control_states
-     * parity). The NTF aggregate always lists every known notify key (the SDK
-     * cache defaults them all to ON), so presence is NOT a capability signal:
-     * an NTF switch is enabled only when DeviceInfo reports channels for the
-     * stream, hidden once state info exists and the stream is unsupported,
-     * and checked only when supported AND the value is ON. The FILTER boxes
-     * are never hidden: they are enabled + checked only when the FILTER
-     * aggregate answered at all (old EMG devices answer it with an error).
-     */
+    // Reads back the NTF and FILTER aggregates ("K|V|K|V") and syncs the
+    // boxes.
     private fun syncSwitches(p: SensorProfile) {
         scope.launch {
             val ntfResult = p.getParam("NTF")
@@ -1692,8 +1462,6 @@ class MainActivity : Activity() {
                 cb.isChecked = hasFilter && filterValues[key] == "ON"
             }
             suppressNtfCallbacks = false
-            // Headless-verification line: the raw aggregate answers plus the
-            // applied per-switch state (enabled/checked/visible).
             Log.i(TAG, "ntf readback: \"$ntfResult\" -> " + ntfChecks.map { (k, cb) ->
                 "$k=${if (cb.isEnabled) "en" else "dis"}/${if (cb.isChecked) "on" else "off"}" +
                         "${if (cb.visibility != View.VISIBLE) "/gone" else ""}"
@@ -1705,13 +1473,7 @@ class MainActivity : Activity() {
 
     // ---- debug log / bin data / auto reconnect toggles ------------------------
 
-    /**
-     * Applies the session log path + setDebugEnabled(true) (Python demo
-     * _apply_sdk_debug_log parity): the session's controller log, per-device
-     * profile logs and bin exports all go into a "<timestamp>_<sdk version>"
-     * subdir of /sdcard/Documents/sensorsdklog; the path must be set BEFORE
-     * setDebugEnabled(true). Each call opens a fresh timestamped subdir.
-     */
+    // Applies the session log path + setDebugEnabled(true).
     private fun applySdkDebugLog() {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val version = controller.version.replace('.', '_')
@@ -1720,7 +1482,7 @@ class MainActivity : Activity() {
         Log.i(TAG, "setLogPath -> /sdcard/Documents/sensorsdklog/${stamp}_$version")
     }
 
-    /** Live (non-replay) states whose link is Ready. */
+    // Live (non-replay) states whose link is Ready.
     private fun readyProfiles(): List<SensorProfile> {
         val states = synchronized(deviceStates) { deviceStates.values.toList() }
         return states.mapNotNull { st ->
@@ -1783,12 +1545,8 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Reads back the EEG sample rate options and the bound rate (after init /
-     * a rate switch / a current-device switch) and syncs the radio buttons;
-     * buttons without a device-reported option stay disabled ("Error: ..."
-     * answers parse to no options / no current rate).
-     */
+    // Reads back the EEG sample rate options and the bound rate and syncs
+    // the radio buttons.
     private fun syncSampleRateControl(p: SensorProfile) {
         scope.launch {
             val options = p.getParam("EEG_SAMPLE_RATE_LIST")
@@ -1805,11 +1563,7 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Syncs only the CHECKED state of the sample rate radios without issuing
-     * setParam (replay path: the buttons stay disabled, no rate switching is
-     * possible). A rate outside SAMPLE_RATE_CANDIDATES clears the selection.
-     */
+    // Syncs only the CHECKED state of the sample rate radios (replay path).
     private fun syncSampleRateChecked(rate: Float) {
         val current = rate.toInt()
         suppressSampleRateCallbacks = true
@@ -1818,7 +1572,7 @@ class MainActivity : Activity() {
         suppressSampleRateCallbacks = false
     }
 
-    /** Link/MTU display from DeviceInfo; "--" for values the link did not report. */
+    // Link/MTU display from DeviceInfo; "--" for values the link did not report.
     private fun updateLinkInfo(info: DeviceInfo) {
         linkText.text =
             if (info.peripheralLatency < 0 || info.connectionIntervalMs <= 0) "Link: --"
@@ -1828,17 +1582,8 @@ class MainActivity : Activity() {
         mtuText.text = if (info.mtuSize <= 0) "MTU: --" else "MTU: ${info.mtuSize}"
     }
 
-    /**
-     * Sample-rate change handling for one device (called after a DeviceInfo
-     * update push, e.g. setParam "EEG_SAMPLE_RATE" rewrote the bound EEG/ECG
-     * rates or a config switch mid-replay re-rated the streams):
-     * rebuilds every waveform ring whose nominal rate changed so the time
-     * window stays consistent with the actual data rate (a stale length
-     * would stretch/compress the waveform). Windows: EEG 1 s (5 s in the
-     * PPG plot set, matching the bio layout), ECG 1 s, ACC/GYRO/EULER/QUAT
-     * 5 s. Rates <= 0 and unchanged lengths are skipped; the views read the
-     * ring length at draw time, so no retargeting is needed.
-     */
+    // Sample-rate change handling for one device: rebuilds every waveform
+    // ring whose nominal rate changed.
     private fun syncSampleRateBuffers(st: DeviceUiState, info: DeviceInfo) {
         val eegWindow = if (st.bioMode == BioMode.PPG) 5.0 else 1.0
         for (f in st.bioFeeds) {
@@ -1855,17 +1600,9 @@ class MainActivity : Activity() {
 
     // ---- bin replay -----------------------------------------------------------
 
-    /**
-     * Starts a realtime (or full-speed) bin replay. The SDK's BinReplay
-     * REJECTS an empty deviceMac ("Error: device_mac is required"), so the
-     * mac recorded in the bin header (getBinFileInfo) is passed; "REPLAY" is
-     * the fallback for headerless captures. The replay-mode profile gets its
-     * own DeviceUiState (keyed by that mac; a collision with a connected
-     * device replaces its display state, Python demo parity) and becomes the
-     * current device; replayed batches flow into its Bio/IMU pages through
-     * processBatches in both direct and queue mode while live devices keep
-     * streaming in the background.
-     */
+    // Starts a realtime (or full-speed) bin replay. The replay profile gets
+    // its own DeviceUiState (keyed by the bin's mac) and becomes the current
+    // device while live devices keep streaming in the background.
     private fun startReplay(path: String, realtime: Boolean) {
         if (path.isEmpty()) {
             setStatus("Replay failed: empty bin path")
@@ -1882,8 +1619,6 @@ class MainActivity : Activity() {
         appLog("User: replay bin file: $path")
         val info = controller.getBinFileInfo(path)
         if (info == null) {
-            // Not fatal here: replayBinFile rejects a config-less capture and
-            // the mac below falls back to "REPLAY".
             appLog("App: invalid bin file (no config record): $path", "W")
         }
         val mac = info?.mac?.takeIf { it.isNotEmpty() } ?: "REPLAY"
@@ -1922,9 +1657,7 @@ class MainActivity : Activity() {
             }
         }
         p.setOnDeviceInfoUpdateListener { _, updated ->
-            // A config switch mid-capture re-rates the streams: rebuild the
-            // rate-dependent rings and re-sync the radio selection (checked
-            // state only; the buttons stay disabled during replay).
+            // A config switch mid-capture re-rates the streams.
             Log.i(TAG, "replay device info update: eeg=${updated.eegSampleRate} " +
                     "ecg=${updated.ecgSampleRate} imu=${updated.imuSampleRate}")
             st.info = updated
@@ -1952,8 +1685,7 @@ class MainActivity : Activity() {
         replayMac = null
         replayPaused = false
         pauseReplayBtn.isEnabled = false
-        // stopBinReplay joins the replay thread, so keep it off the UI thread;
-        // the EOF state event removes the replay device state.
+        // Keep the join off the UI thread.
         scope.launch(Dispatchers.IO) {
             val result = controller.stopBinReplay(mac)
             appLog("User: stop replay -> $result", if (result == "OK") "I" else "W", rp)
@@ -1964,11 +1696,7 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Pause/resume the running replay (Qt MainWindow::onReplayPauseResume
-     * parity): the button text follows the state; a non-OK result keeps the
-     * previous state.
-     */
+    // Pause/resume the running replay.
     private fun onReplayPauseResume() {
         val mac = replayMac ?: return
         val action = if (replayPaused) "resume" else "pause"
@@ -1984,12 +1712,7 @@ class MainActivity : Activity() {
         setStatus(if (replayPaused) "Replay paused" else "Replaying ...")
     }
 
-    /**
-     * Parses the bin file in the path field to CSV (Qt "Analyze Bin" parity):
-     * the CSV lands next to the bin (".bin" -> ".csv"), parseBinToCsv runs on
-     * a worker thread (it blocks for the whole parse), and the button is
-     * re-entry guarded while a parse runs.
-     */
+    // Parses the bin file in the path field to CSV.
     private fun onAnalyzeBin() {
         if (analyzing) return
         val path = replayPathEdit.text.toString().trim()
@@ -2026,27 +1749,19 @@ class MainActivity : Activity() {
 
     // ---- data processing ---------------------------------------------------------
 
-    /**
-     * Feeds one device's batch list into its views. Runs on the data worker
-     * thread - the WaveformView/CubeView append/set methods are
-     * synchronized, and the redraw is timer-driven. Batches for a device
-     * whose state is already gone (disconnect raced the queue) are dropped.
-     */
+    // Feeds one device's batch list into its views.
     private fun processBatches(mac: String, dataList: List<SensorData>) {
         val st = synchronized(deviceStates) { deviceStates[mac] } ?: return
         for (d in dataList) {
             st.batches++
             st.samples += d.channelCount.toLong() * d.sampleCount
             st.lostPackages += d.lostPackageCount
-            // Probe the batch once up front. false = stale batch: Your data
-            // process runs too slow cause it.
+            // Probe the batch once up front.
             val fresh = d.isDataValid()
-            // Per-type rate/loss bookkeeping (Qt DeviceState::appendData
-            // parity); the IMU aggregate additionally counts its segments.
+            // Per-type rate/loss bookkeeping.
             accountBatch(st, d, fresh)
             if (d.dataType == DataType.NTF_IMU) accountImuSegments(st, d, fresh)
-            // One-time per-type probe: dump metadata and the first sample so
-            // a data/layout mismatch is visible in logcat.
+            // One-time per-type probe: dump metadata and the first sample.
             if (st.diagTypes.add(d.dataType)) {
                 val s = d.getChannelSample(0, 0)
                 Log.i(TAG, "diag[$mac] type=${d.dataType} ch=${d.channelCount} n=${d.sampleCount} " +
@@ -2054,13 +1769,10 @@ class MainActivity : Activity() {
                         "fresh(0,0)=${d.isDataValid()} | " +
                         "sample(0,0)=" + (if (s != null) "idx=${s.sampleIndex} data=${s.data}" else "null"))
             }
-            // Bio page: auto mode routing (EMG/EEG/PPG). maybeReconfigureBio
-            // repairs the mode from observed batches; a channel-count change
-            // re-layouts the slots.
+            // Bio page: auto mode routing (EMG/EEG/PPG).
             maybeReconfigureBio(st, d)
-            // Bio slots bound to this stream (Qt DeviceState ring append
-            // parity): each bound slot reads its one channel; bio types pass
-            // through the device's Live Filter before entering the ring.
+            // Bio slots bound to this stream; bio types pass through the
+            // device's Live Filter before entering the ring.
             val feeds = st.bioFeeds
             for (f in feeds) {
                 if (f.dataType != d.dataType || f.channel >= d.channelCount) continue
@@ -2071,8 +1783,8 @@ class MainActivity : Activity() {
             updateImpedances(st, d, fresh)
             when (d.dataType) {
                 DataType.NTF_IMU -> {
-                    // Aggregate stream (new EMG devices): acc 0-2 / gyro 3-5 /
-                    // euler 6-8 / quat 9-12 (w=9, x=10, y=11, z=12).
+                    // Aggregate stream: acc 0-2 / gyro 3-5 / euler 6-8 /
+                    // quat 9-12.
                     st.accView.appendBatch(d, 0, 3)
                     st.gyroView.appendBatch(d, 3, 3)
                     if (d.channelCount >= 13) {
@@ -2089,8 +1801,7 @@ class MainActivity : Activity() {
                     feedCube(st, d, 0)
                 }
                 DataType.NTF_GEST -> {
-                    // Gesture box: the last sample of the batch carries the
-                    // current gesture data (Qt DeviceState parity).
+                    // Gesture box: the last sample carries the current data.
                     val n = d.sampleCount
                     if (fresh && d.isChannelEnabled(0) && n > 0) {
                         val s = d.getChannelSample(0, n - 1)
@@ -2105,8 +1816,7 @@ class MainActivity : Activity() {
                 else -> {} // impedance/ADS/MAG streams: counters only
             }
         }
-        // The stats labels refresh with the UI timer; the per-batch logcat
-        // heartbeat below is throttled for headless verification (~1 line/sec).
+        // Throttled per-batch logcat heartbeat.
         val now = System.currentTimeMillis()
         if (now - st.lastLogMs >= 1000) {
             st.lastLogMs = now
@@ -2114,12 +1824,7 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Per-type stats bookkeeping for one batch (Qt DeviceState::appendData
-     * parity): latest cumulative lost-package count per type, valid-sample
-     * rate counting (masked/lost slots excluded), nominal rate/channels, and
-     * the stream-start wall clock + first-packet delay for the rate line.
-     */
+    // Per-type stats bookkeeping for one batch.
     private fun accountBatch(st: DeviceUiState, d: SensorData, fresh: Boolean) {
         synchronized(st.rateLock) {
             if (d.lostPackageCount > 0) {
@@ -2142,9 +1847,8 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Per-segment rate bookkeeping of an NTF_IMU aggregate batch (Qt
-     * DeviceState::appendImuSegments parity: acc 0-2 / gyro 3-5 / euler 6-8 /
-     * quat 9-12). Lost-package bookkeeping stays with the top-level batch. */
+    // Per-segment rate bookkeeping of an NTF_IMU aggregate batch (acc 0-2 /
+    // gyro 3-5 / euler 6-8 / quat 9-12).
     private fun accountImuSegments(st: DeviceUiState, d: SensorData, fresh: Boolean) {
         val segs = arrayOf(
             intArrayOf(DataType.NTF_ACC, 0, 3),
@@ -2168,12 +1872,8 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Latest impedance per bio channel (Qt DeviceState appendData parity):
-     * the bio batches carry the per-channel impedance readout; the last
-     * sample of the batch is the newest. Masked-out channels and stale
-     * batches are skipped; unknown slots stay -1.
-     */
+    // Latest impedance per bio channel: the last sample of the batch is the
+    // newest.
     private fun updateImpedances(st: DeviceUiState, d: SensorData, fresh: Boolean) {
         val kind = when (d.dataType) {
             DataType.NTF_EMG -> IMP_EMG
@@ -2193,12 +1893,7 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Impedance side texts of one device's bio slots (Qt
-     * MainWindow::refreshBioSideTexts parity): "%.2f KOhm" on the right
-     * margin, green <= 500, orange <= 999, red above; unknown (-1) keeps the
-     * previous text. UI thread (called from the UI refresh timer).
-     */
+    // Impedance side texts of one device's bio slots.
     private fun refreshBioSideTexts(st: DeviceUiState) {
         for (f in st.bioFeeds) {
             if (f.impKind < 0) continue
@@ -2216,12 +1911,11 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Latest sample of a 4-channel quaternion segment drives the cube. */
+    // Latest sample of a 4-channel quaternion segment drives the cube.
     private fun feedCube(st: DeviceUiState, d: SensorData, quatChannelOffset: Int) {
         val last = d.sampleCount - 1
         if (last < 0) return
         // Probe the batch once; skip the pose update on failure.
-        // false = stale batch: Your data process runs too slow cause it.
         if (!d.isDataValid()) return
         st.cubeView.setQuaternion(
             d.getData(quatChannelOffset + 0, last).toDouble(),
@@ -2239,8 +1933,7 @@ class MainActivity : Activity() {
             gestureText.text = GESTURE_EMPTY_TEXT
             return
         }
-        // Per-type batch/loss lines (Qt "Packet Loss Stats" parity), in the
-        // fixed display order; only types that have delivered data appear.
+        // Per-type batch/loss lines.
         val sb = StringBuilder("Batches: ${st.batches} (lost pkgs: ${st.lostPackages})")
         synchronized(st.rateLock) {
             for ((type, name) in TYPE_DISPLAY_ORDER) {
@@ -2258,12 +1951,7 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Measured-vs-nominal rate line (Qt DeviceState::buildRateText parity):
-     * "<type> <actual> / <nominal>Hz" per type that delivered data in the
-     * last window, plus the stream-start wall clock and the first-packet
-     * delay; empty when nothing is known yet.
-     */
+    // Measured-vs-nominal rate line.
     private fun buildRateText(st: DeviceUiState): String {
         val entries = ArrayList<String>()
         synchronized(st.rateLock) {
@@ -2285,13 +1973,7 @@ class MainActivity : Activity() {
         return if (entries.isEmpty()) "" else "Actual: " + entries.joinToString(" | ")
     }
 
-    /**
-     * Clears one device's data views (connect/replay start): a new data
-     * session, so in-flight spectrum results from the old session are
-     * dropped, and the device's live filter state is rebuilt. The impedance
-     * readouts and the gesture box fall back to "unknown" (Qt
-     * DeviceState::clearBuffers parity).
-     */
+    // Clears one device's data views (connect/replay start).
     private fun clearDataViews(st: DeviceUiState) {
         st.dataSession++
         st.liveFilter.reset()
@@ -2319,13 +2001,9 @@ class MainActivity : Activity() {
         statusText.text = s
     }
 
-    /**
-     * Writes one application event line into the SDK log (Python demo
-     * _app_log parity): into the given (or current) device's profile log
-     * when a device is the subject, else into the controller log, so the
-     * lines share the SDK's internal log timeline. The level is the first
-     * character of `level` (D/I/W/E, case-insensitive; default "I").
-     */
+    // Writes one application event line into the SDK log: into the given (or
+    // current) device's profile log when a device is the subject, else into
+    // the controller log.
     private fun appLog(message: String, level: String = "I", sensor: SensorProfile? = null) {
         val target = sensor ?: currentState()?.profile
         if (target != null) {
@@ -2337,6 +2015,12 @@ class MainActivity : Activity() {
 
     // ---- lifecycle ---------------------------------------------------------------
 
+    override fun onStop() {
+        // Background: flush the SDK capture and log files.
+        if (::controller.isInitialized) controller.onSuspend()
+        super.onStop()
+    }
+
     override fun onDestroy() {
         appLog("App: demo window closing")
         scope.cancel()
@@ -2344,7 +2028,7 @@ class MainActivity : Activity() {
         fftExecutor.shutdownNow()
         dataWorkerStop.set(true)
         dataWorker?.interrupt()
-        // Fire-and-forget teardown (the listeners may already be dead).
+        // Fire-and-forget teardown.
         replayMac?.let { controller.stopBinReplay(it) }
         replayProfile = null
         replayMac = null

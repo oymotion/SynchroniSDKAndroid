@@ -9,16 +9,7 @@ import android.view.View
 import kotlin.math.min
 import kotlin.math.sqrt
 
-/**
- * Quaternion-driven 3D cube (port of the Qt demo's CubeWidget): the
- * quaternion is normalized, converted to a rotation matrix, the 8 unit-cube
- * vertices are rotated and perspective-projected, and the 6 faces are filled
- * far-to-near (painter's algorithm) plus the 12 edges.
- *
- * setQuaternion/clearQuaternion are synchronized and safe to call from the
- * data worker thread; drawing runs on the UI thread, driven by a periodic
- * UI timer.
- */
+// Quaternion-driven 3D cube.
 class CubeView(context: Context) : View(context) {
 
     private val lock = Any()
@@ -72,7 +63,7 @@ class CubeView(context: Context) : View(context) {
             return
         }
 
-        // Rotation matrix from the quaternion (same formula as the Qt demo).
+        // Rotation matrix from the quaternion.
         var w = q[0]; var x = q[1]; var y = q[2]; var z = q[3]
         val norm = sqrt(w * w + x * x + y * y + z * z)
         if (norm <= 0.0) return
@@ -103,7 +94,7 @@ class CubeView(context: Context) : View(context) {
             )
         }
 
-        // Painter's algorithm: far faces first (larger z = farther).
+        // Far faces first.
         val order = (0 until 6).sortedByDescending { f ->
             FACES[f].sumOf { rotated[it][2] }
         }
@@ -121,7 +112,7 @@ class CubeView(context: Context) : View(context) {
     }
 
     private companion object {
-        // Unit cube vertices (same layout as the Qt demo).
+        // Unit cube vertices.
         val VERTICES = arrayOf(
             doubleArrayOf(-1.0, -1.0, -1.0), doubleArrayOf(1.0, -1.0, -1.0),
             doubleArrayOf(1.0, 1.0, -1.0), doubleArrayOf(-1.0, 1.0, -1.0),
