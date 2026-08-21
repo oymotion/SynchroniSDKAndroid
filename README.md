@@ -273,8 +273,9 @@ val power = profile.getBatteryLevel()   // suspend extension; 0-100,
 ### 13. setParam / getParam
 
 `setParam(key, value)` (suspend; callback style also available) configures
-the profile after `READY`. Changing an `NTF_*` or `FILTER_*` key while
-streaming restarts the data notification so the setting takes effect.
+the profile after `READY`. Changing an `NTF_*` key while streaming restarts
+the data notification so the setting takes effect; `FILTER_*` keys are
+applied on the fly without interrupting the stream.
 Returns `"OK"` on success or a string starting with `"Error"`.
 
 ```kotlin
