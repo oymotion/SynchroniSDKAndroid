@@ -59,7 +59,7 @@ private const val DATA_QUEUE_CAPACITY = 1000
 private const val FFT_UPDATE_INTERVAL_MS = 500L
 
 // The demo's own version, shown in the title.
-private const val DEMO_VERSION = "0.1.2"
+private const val DEMO_VERSION = "0.1.7"
 
 // EEG sample rate options offered on the Device page (Hz).
 private val SAMPLE_RATE_CANDIDATES = listOf(250, 500, 1000, 2000)
@@ -234,6 +234,8 @@ class MainActivity : Activity() {
     // Bin replay state; replayMac keys the replay DeviceUiState.
     private var replayProfile: SensorProfile? = null
     private var replayMac: String? = null
+    // Group replay member macs (';'-separated paths in the path field).
+    private val replayMacs = mutableListOf<String>()
 
     // Page widgets.
     private lateinit var pageContainer: FrameLayout
@@ -253,6 +255,9 @@ class MainActivity : Activity() {
     // Device page widgets.
     private lateinit var scanBtn: Button
     private lateinit var connectBtn: Button
+    private lateinit var multiBtn: Button
+    // True while a multi start/stop op is in flight.
+    private var multiOpActive = false
     private lateinit var statusText: TextView
     private lateinit var rateText: TextView
     private lateinit var batteryText: TextView
@@ -272,6 +277,7 @@ class MainActivity : Activity() {
     private lateinit var binDataCheck: CheckBox
     private lateinit var replayPathEdit: EditText
     private lateinit var replayBtn: Button
+    private lateinit var multiReplayBtn: Button
     private lateinit var pauseReplayBtn: Button
     private lateinit var stopReplayBtn: Button
     private lateinit var analyzeBtn: Button
@@ -407,6 +413,16 @@ class MainActivity : Activity() {
         btnRow.addView(scanBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         btnRow.addView(connectBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         page.addView(btnRow)
+
+        // Synchronized multi-device stream start.
+        val multiRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        multiBtn = Button(this).apply {
+            text = "Multi Start"
+            isEnabled = false
+            setOnClickListener { onMultiStart() }
+        }
+        multiRow.addView(multiBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        page.addView(multiRow)
 
         statusText = TextView(this).apply { textSize = 13f }
         sdkText = TextView(this).apply { textSize = 13f }
@@ -564,6 +580,10 @@ class MainActivity : Activity() {
             text = "Replay Bin"
             setOnClickListener { startReplay(replayPathEdit.text.toString().trim(), true) }
         }
+        multiReplayBtn = Button(this).apply {
+            text = "Multi Replay Bin"
+            setOnClickListener { onMultiReplay() }
+        }
         pauseReplayBtn = Button(this).apply {
             text = "Pause Replay"
             isEnabled = false
@@ -578,6 +598,7 @@ class MainActivity : Activity() {
             setOnClickListener { onAnalyzeBin() }
         }
         replayRow.addView(replayBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        replayRow.addView(multiReplayBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         replayRow.addView(pauseReplayBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         replayRow.addView(stopReplayBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         replayRow.addView(analyzeBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
@@ -1386,6 +1407,105 @@ class MainActivity : Activity() {
                 (ds == DeviceState.READY || ds == DeviceState.CONNECTED || ds == DeviceState.CONNECTING)
         connectBtn.text = if (linked) "Disconnect" else "Connect"
         connectBtn.isEnabled = selectedMac != null && (st == null || !st.isReplay)
+        val states = synchronized(deviceStates) { deviceStates.values.toList() }
+        multiBtn.isEnabled = !multiOpActive && states.any { !it.isReplay }
+    }
+
+    // ---- synchronized multi-device stream start/stop -------------------------
+
+    // Multi Start button.
+    private fun onMultiStart() {
+        val sensors = synchronized(deviceStates) {
+            deviceStates.values.filter {
+                !it.isReplay && it.profile?.let { pr -> pr.isReady() && pr.hasInited() } == true
+            }.map { it.profile!! }
+        }
+        if (sensors.isEmpty()) {
+            appLog("User: multi start rejected (no connected device)", "W")
+            setStatus("No connected device to sync-start")
+            return
+        }
+        appLog("User: multi start on ${sensors.size} device(s)")
+        multiOpActive = true
+        multiBtn.isEnabled = false
+        val transferring = sensors.filter { it.isDataTransfering() }
+        if (transferring.isNotEmpty()) {
+            controller.multiStopDataNotification(transferring, 10000) { results, _ ->
+                val stopFailed = results.filterValues { !it }.keys
+                if (stopFailed.isNotEmpty()) {
+                    val macs = stopFailed.joinToString(", ")
+                    appLog("App: multi stop failed on: $macs", "W")
+                    mainHandler.post {
+                        setStatus("Multi stop failed on: $macs")
+                        multiOpActive = false
+                        updateConnectButton()
+                    }
+                    return@multiStopDataNotification
+                }
+                doMultiStart(sensors)
+            }
+            return
+        }
+        doMultiStart(sensors)
+    }
+
+    // Same model name on all devices -> default sync params; mixed/unknown
+    // models -> relaxed params.
+    private fun doMultiStart(sensors: List<SensorProfile>) {
+        val names = sensors.map { it.getDeviceInfo()?.modelName }.toSet()
+        val sameModel = names.size == 1 && null !in names
+        val timeoutMs = if (sameModel) 30000 else 60000
+        val maxDelayDispersionMs = if (sameModel) 5 else -1
+        val maxAttempts = if (sameModel) 3 else 5
+        controller.multiStartDataNotification(sensors, timeoutMs, maxDelayDispersionMs,
+                maxAttempts) { results, errors ->
+            mainHandler.post {
+                reportMultiResult("start", "started", results, errors)
+                multiOpActive = false
+                updateConnectButton()
+            }
+        }
+    }
+
+    // Multi-device stream stop flow.
+    private fun onMultiStop() {
+        val sensors = synchronized(deviceStates) {
+            deviceStates.values.filter {
+                !it.isReplay && it.profile?.isDataTransfering() == true
+            }.map { it.profile!! }
+        }
+        if (sensors.isEmpty()) {
+            appLog("User: multi stop rejected (no streaming device)", "W")
+            setStatus("No streaming device to sync-stop")
+            return
+        }
+        appLog("User: multi stop on ${sensors.size} device(s)")
+        multiOpActive = true
+        multiBtn.isEnabled = false
+        controller.multiStopDataNotification(sensors, 10000) { results, errors ->
+            mainHandler.post {
+                reportMultiResult("stop", "stopped", results, errors)
+                multiOpActive = false
+                updateConnectButton()
+            }
+        }
+    }
+
+    // Status + per-mac log lines for a multi start/stop result.
+    private fun reportMultiResult(action: String, past: String,
+                                  results: Map<String, Boolean>,
+                                  errors: Map<String, String>) {
+        val failed = results.filterValues { !it }.keys
+        for (mac in failed) {
+            val pr = synchronized(deviceStates) { deviceStates[mac] }?.profile
+            appLog("App: multi $action failed[$mac]: ${errors[mac] ?: ""}", "W", pr)
+        }
+        if (failed.isEmpty()) {
+            appLog("App: multi $action OK: ${results.size} device(s) $past")
+            setStatus("Multi $action: ${results.size} device(s) $past")
+        } else {
+            setStatus("Multi $action failed on: ${failed.joinToString(", ")}")
+        }
     }
 
     // ---- NTF / FILTER switches (suspend setParam / getParam) -----------------
@@ -1600,6 +1720,17 @@ class MainActivity : Activity() {
 
     // ---- bin replay -----------------------------------------------------------
 
+    // Multi Replay Bin button: the path field is a ';'-separated path list.
+    private fun onMultiReplay() {
+        val paths = replayPathEdit.text.toString()
+            .split(';').map { it.trim() }.filter { it.isNotEmpty() }
+        if (paths.size < 2) {
+            setStatus("Multi replay needs multiple ';'-separated bin paths")
+            return
+        }
+        startGroupReplay(paths, true)
+    }
+
     // Starts a realtime (or full-speed) bin replay. The replay profile gets
     // its own DeviceUiState (keyed by the bin's mac) and becomes the current
     // device while live devices keep streaming in the background.
@@ -1612,7 +1743,7 @@ class MainActivity : Activity() {
             setStatus("Replay failed: file not found: $path")
             return
         }
-        if (replayMac != null) {
+        if (replayMac != null || replayMacs.isNotEmpty()) {
             setStatus("Stop the running replay first")
             return
         }
@@ -1632,6 +1763,60 @@ class MainActivity : Activity() {
         replayPaused = false
         pauseReplayBtn.isEnabled = true
         pauseReplayBtn.text = "Pause Replay"
+        setupReplayMember(mac, p, info)
+        setCurrentDevice(mac)
+        Log.i(TAG, "replay started: path=$path mac=$mac realtime=$realtime info=$info")
+        setStatus("Replaying $path (mac=$mac, realtime=$realtime) ...")
+    }
+
+    // Starts a synchronized replay of several bins on a shared clock. Each
+    // member gets the same DeviceUiState / [Replay] row setup as a single
+    // replay; the first started member becomes the current device.
+    private fun startGroupReplay(paths: List<String>, realtime: Boolean) {
+        if (replayMac != null || replayMacs.isNotEmpty()) {
+            setStatus("Stop the running replay first")
+            return
+        }
+        appLog("User: replay ${paths.size} bin files: ${paths.joinToString("; ")}")
+        val infos = ArrayList<BinFileInfo?>()
+        val macs = ArrayList<String>()
+        for (path in paths) {
+            if (!File(path).exists()) {
+                setStatus("Replay failed: file not found: $path")
+                return
+            }
+            val info = controller.getBinFileInfo(path)
+            if (info == null) {
+                appLog("App: invalid bin file (no config record): $path", "W")
+            }
+            infos.add(info)
+            macs.add(info?.mac?.takeIf { it.isNotEmpty() } ?: "REPLAY")
+        }
+        val profiles = controller.multiReplayBinFile(paths, macs, realtime, 5000)
+        for (i in paths.indices) {
+            val p = profiles[i]
+            if (p == null) {
+                appLog("App: replay failed to start: ${paths[i]} (mac=${macs[i]})", "W")
+                continue
+            }
+            replayMacs.add(macs[i])
+            setupReplayMember(macs[i], p, infos[i])
+        }
+        if (replayMacs.isEmpty()) {
+            setStatus("Replay failed: multiReplayBinFile started no member")
+            return
+        }
+        replayPaused = false
+        pauseReplayBtn.isEnabled = true
+        pauseReplayBtn.text = "Pause Replay"
+        setCurrentDevice(replayMacs.first())
+        Log.i(TAG, "group replay started: members=${replayMacs.size} realtime=$realtime")
+        setStatus("Replaying ${replayMacs.size} bin files (realtime=$realtime) ...")
+    }
+
+    // Registers one replay profile (single replay or group member): its
+    // DeviceUiState / [Replay] row and the replay listeners.
+    private fun setupReplayMember(mac: String, p: SensorProfile, info: BinFileInfo?) {
         val st = registerDeviceState(mac, p, isReplay = true)
         st.info = info?.deviceInfo
         clearDataViews(st)
@@ -1640,18 +1825,28 @@ class MainActivity : Activity() {
             p.log("App: error callback: $errorMsg", "E")
             mainHandler.post { if (mac == currentMac) setStatus("Replay: $errorMsg") }
         }
-        p.setOnStateChangeListener { _, newState ->
+        p.setOnDataTransferStateChangeListener { _, isTransferring ->
+            // Stream on/off signal; replay EOF arrives as the OFF push (a
+            // valid bin always pairs the ON from loadReplayConfig with the
+            // OFF from endReplay).
+            st.transferring = isTransferring
+            appLog("App: data stream ${if (isTransferring) "ON" else "OFF"} $mac", "I", p)
             mainHandler.post {
-                if (newState == DeviceState.DISCONNECTED) {
-                    // The replay profile drops back to Disconnected at EOF.
+                refreshDeviceList()
+                if (!isTransferring) {
                     Log.i(TAG, "replay finished: batches=${st.batches} " +
                             "samples=${st.samples} lostPkgs=${st.lostPackages}")
                     appLog("App: replay done: Replay finished (${st.batches} batches, ${st.samples} samples)")
                     setStatus("Replay finished (${st.batches} batches, ${st.samples} samples)")
-                    replayProfile = null
-                    replayMac = null
-                    replayPaused = false
-                    pauseReplayBtn.isEnabled = false
+                    replayMacs.remove(mac)
+                    if (replayMac == mac) {
+                        replayProfile = null
+                        replayMac = null
+                    }
+                    if (replayMac == null && replayMacs.isEmpty()) {
+                        replayPaused = false
+                        pauseReplayBtn.isEnabled = false
+                    }
                     removeDeviceState(mac)
                 }
             }
@@ -1669,40 +1864,46 @@ class MainActivity : Activity() {
                 }
             }
         }
-        setCurrentDevice(mac)
-        Log.i(TAG, "replay started: path=$path mac=$mac realtime=$realtime info=$info")
-        setStatus("Replaying $path (mac=$mac, realtime=$realtime) ...")
     }
 
     private fun stopReplay() {
-        val mac = replayMac
-        if (mac == null) {
+        val macs = mutableListOf<String>()
+        replayMac?.let { macs.add(it) }
+        macs.addAll(replayMacs)
+        if (macs.isEmpty()) {
             setStatus("No replay running")
             return
         }
         val rp = replayProfile
         replayProfile = null
         replayMac = null
+        replayMacs.clear()
         replayPaused = false
         pauseReplayBtn.isEnabled = false
         // Keep the join off the UI thread.
         scope.launch(Dispatchers.IO) {
-            val result = controller.stopBinReplay(mac)
-            appLog("User: stop replay -> $result", if (result == "OK") "I" else "W", rp)
-            Log.i(TAG, "stopBinReplay($mac) -> $result")
+            var result = "OK"
+            for (m in macs) {
+                val r = controller.stopBinReplay(m)
+                if (r != "OK") result = r
+                val member = synchronized(deviceStates) { deviceStates[m] }?.profile
+                appLog("User: stop replay -> $r", if (r == "OK") "I" else "W", member ?: rp)
+                Log.i(TAG, "stopBinReplay($m) -> $r")
+            }
             withContext(Dispatchers.Main) {
                 setStatus("stopBinReplay -> $result")
             }
         }
     }
 
-    // Pause/resume the running replay.
+    // Pause/resume the running replay (one call covers a whole group).
     private fun onReplayPauseResume() {
-        val mac = replayMac ?: return
+        val mac = replayMac ?: replayMacs.firstOrNull() ?: return
         val action = if (replayPaused) "resume" else "pause"
         val result = if (replayPaused) controller.resumeBinReplay(mac)
                      else controller.pauseBinReplay(mac)
-        appLog("User: $action replay -> $result", if (result == "OK") "I" else "W", replayProfile)
+        appLog("User: $action replay -> $result", if (result == "OK") "I" else "W",
+               replayProfile ?: synchronized(deviceStates) { deviceStates[mac] }?.profile)
         if (result != "OK") {
             setStatus("Replay pause/resume failed: $result")
             return
@@ -2030,6 +2231,8 @@ class MainActivity : Activity() {
         dataWorker?.interrupt()
         // Fire-and-forget teardown.
         replayMac?.let { controller.stopBinReplay(it) }
+        for (m in replayMacs) controller.stopBinReplay(m)
+        replayMacs.clear()
         replayProfile = null
         replayMac = null
         val states = synchronized(deviceStates) { deviceStates.values.toList() }

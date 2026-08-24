@@ -356,6 +356,14 @@ controller.pauseBinReplay(mac)     // "OK" or an error string
 controller.resumeBinReplay(mac)
 controller.stopBinReplay(mac)
 
+// Synchronized group replay: every (path, mac) capture starts on one shared
+// clock anchored at the earliest data record, so concurrently recorded
+// captures keep their original relative offsets. The returned list is
+// input-order aligned with null entries for members that failed validation.
+val group = controller.multiReplayBinFile(listOf(path1, path2),
+                                          listOf(mac1, mac2),
+                                          realtime = true, timeoutMs = 5000)
+
 // Offline conversion to CSV; returns the CSV file path
 val csvPath = controller.parseBinToCsv(binPath, csvPath)
 ```
@@ -391,7 +399,13 @@ multi-device scan/connect with per-device state, three pages (Device / Bio /
 IMU), bio waveforms with a live band-pass filter picker, IMU waveforms with
 FFT spectra and a 3D quaternion cube, NTF/FILTER/sample-rate controls,
 battery display, auto reconnect, SDK debug log and bin export toggles, and
-bin replay / parse-to-CSV.
+bin replay / parse-to-CSV. A Multi Start/Stop toggle button starts (or
+stops) streaming on all connected devices in sync via
+`multiStartDataNotification` / `multiStopDataNotification`, and a Multi
+Replay Bin button replays several captures at once through
+`multiReplayBinFile` with group-wide pause/resume. Replay end-of-file is
+reported through `setOnDataTransferStateChangeListener` (isTransferring
+flips to false).
 
 Build:
 
