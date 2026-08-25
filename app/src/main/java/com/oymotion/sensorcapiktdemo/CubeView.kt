@@ -74,7 +74,7 @@ class CubeView(context: Context) : View(context) {
             doubleArrayOf(2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y))
         )
 
-        val scale = min(width, height) * 0.28
+        val scale = min(width, height) * 0.38
         val cx = width / 2.0
         val cy = height / 2.0
         val cameraDist = 4.5

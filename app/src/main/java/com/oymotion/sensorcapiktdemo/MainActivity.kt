@@ -11,6 +11,7 @@ import android.os.Environment
 import android.graphics.Color
 import android.os.Handler
 import android.os.Looper
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.util.Log
 import android.view.View
@@ -58,8 +59,11 @@ private const val DATA_QUEUE_CAPACITY = 1000
 // Spectrum recompute interval (ms).
 private const val FFT_UPDATE_INTERVAL_MS = 500L
 
+// File picker request code.
+private const val REQUEST_PICK_REPLAY_FILE = 42
+
 // The demo's own version, shown in the title.
-private const val DEMO_VERSION = "0.1.7"
+private const val DEMO_VERSION = "0.1.13"
 
 // EEG sample rate options offered on the Device page (Hz).
 private val SAMPLE_RATE_CANDIDATES = listOf(250, 500, 1000, 2000)
@@ -276,6 +280,7 @@ class MainActivity : Activity() {
     private lateinit var debugLogCheck: CheckBox
     private lateinit var binDataCheck: CheckBox
     private lateinit var replayPathEdit: EditText
+    private var sessionLogDir: String? = null
     private lateinit var replayBtn: Button
     private lateinit var multiReplayBtn: Button
     private lateinit var pauseReplayBtn: Button
@@ -302,6 +307,7 @@ class MainActivity : Activity() {
 
     // Session-wide toggles.
     private var autoReconnect = true
+    private val savedParamsByMac = mutableMapOf<String, MutableMap<String, String>>()
     private var debugLogEnabled = true
     private var binDataEnabled = true
     private var replayPaused = false
@@ -346,12 +352,15 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        root.addView(buildTabBar(), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         pageContainer = FrameLayout(this)
         root.addView(pageContainer, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         pageContainer.addView(buildDevicePage())
         pageContainer.addView(buildWaveformPage())
         pageContainer.addView(buildImuPage())
+        root.addView(buildTabBar(), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply {
+            val m = dp(20)
+            setMargins(m, m, m, m)
+        })
         setContentView(root)
         showPage(0)
         startDataWorker()
@@ -365,6 +374,8 @@ class MainActivity : Activity() {
         if (debugLogEnabled) {
             applySdkDebugLog()
         }
+        // Default to the session debug log dir.
+        replayPathEdit.setText(defaultReplayPath())
         controller.registerBleBridge(applicationContext)
         setStatus("SDK version: ${controller.version}")
 
@@ -539,7 +550,7 @@ class MainActivity : Activity() {
         page.addView(filterRow)
 
         // EEG sample rate options.
-        val srRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val srRow = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val srLabel = TextView(this).apply {
             text = "EEG Sample Rate"
             textSize = 13f
@@ -570,15 +581,15 @@ class MainActivity : Activity() {
         // Bin replay section.
         replayPathEdit = EditText(this).apply {
             setSingleLine()
-            // Default to the app-private external files dir:
-            //   adb push test.bin /sdcard/Android/data/<package>/files/
-            setText("${getExternalFilesDir(null)}/test.bin")
         }
-        page.addView(replayPathEdit)
-        val replayRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        page.addView(replayPathEdit, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        val replayRow = FlowLayout(this).apply {
+            horizontalSpacing = dp(8)
+            verticalSpacing = dp(4)
+        }
         replayBtn = Button(this).apply {
             text = "Replay Bin"
-            setOnClickListener { startReplay(replayPathEdit.text.toString().trim(), true) }
+            setOnClickListener { pickReplayFile() }
         }
         multiReplayBtn = Button(this).apply {
             text = "Multi Replay Bin"
@@ -597,11 +608,11 @@ class MainActivity : Activity() {
             text = "Analyze Bin"
             setOnClickListener { onAnalyzeBin() }
         }
-        replayRow.addView(replayBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        replayRow.addView(multiReplayBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        replayRow.addView(pauseReplayBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        replayRow.addView(stopReplayBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        replayRow.addView(analyzeBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        replayRow.addView(replayBtn, ViewGroup.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        replayRow.addView(multiReplayBtn, ViewGroup.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        replayRow.addView(pauseReplayBtn, ViewGroup.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        replayRow.addView(stopReplayBtn, ViewGroup.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        replayRow.addView(analyzeBtn, ViewGroup.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         page.addView(replayRow)
         // The page scrolls.
         return ScrollView(this).apply { addView(page) }
@@ -746,7 +757,10 @@ class MainActivity : Activity() {
         st.imuPage.addView(st.eulerSpectrum, LinearLayout.LayoutParams(MATCH_PARENT, 0, 0.5f))
         st.imuPage.addView(st.quatView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         st.imuPage.addView(st.quatSpectrum, LinearLayout.LayoutParams(MATCH_PARENT, 0, 0.5f))
-        st.imuPage.addView(st.cubeView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        st.imuPage.addView(st.cubeView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 2f).apply {
+            val m = dp(8)
+            setMargins(m, m, m, m)
+        })
         st.spectrumFeeds = listOf(
             SpectrumFeed(st.accView, st.accSpectrum),
             SpectrumFeed(st.gyroView, st.gyroSpectrum),
@@ -1170,7 +1184,7 @@ class MainActivity : Activity() {
                 s == DeviceState.READY || s == DeviceState.CONNECTED || s == DeviceState.CONNECTING
             } == true
             buildString {
-                append("${d.name}  [${d.mac}]  rssi=${d.rssi}")
+                append("rssi=${d.rssi}  ${d.name}  [${d.mac}]")
                 if (st != null && st.isReplay) append("  [replay]")
                 else if (linked) append("  [connected]")
                 if (st?.transferring == true) append("  [streaming]")
@@ -1219,6 +1233,11 @@ class MainActivity : Activity() {
                 return
             }
         }
+        connectDevice(mac, restoreParams = false)
+    }
+
+    // Connect + init + stream; each step skips itself when already done.
+    private fun connectDevice(mac: String, restoreParams: Boolean) {
         // Stop the scan loop before connecting.
         if (scanning) {
             scanning = false
@@ -1240,25 +1259,30 @@ class MainActivity : Activity() {
                 }
                 // New connections inherit the current Auto Reconnect toggle.
                 prof.setAutoReconnect(autoReconnect)
-                val st = registerDeviceState(mac, prof, isReplay = false)
-                attachListeners(st)
+                val kept = synchronized(deviceStates) { deviceStates[mac] }
+                val st = if (kept != null && !kept.isReplay && kept.profile === prof) {
+                    kept
+                } else {
+                    registerDeviceState(mac, prof, isReplay = false).also { attachListeners(it) }
+                }
 
-                if (!prof.connect()) {
+                if (!prof.isReady() && !prof.connect()) {
                     appLog("App: failed to connect to ${dev?.name ?: ""} ($mac)", "E", prof)
                     setStatus("Connect failed")
                     removeDeviceState(mac)
                     updateConnectButton()
                     return@launch
                 }
-                setStatus("Connected, init ...")
-
-                // batch 15 samples/channel, 30 s init timeout, battery poll 60 s
-                if (!prof.init(15, 30000, 60000)) {
-                    appLog("App: failed to initialize ${dev?.name ?: ""} ($mac)", "E", prof)
-                    setStatus("Init failed")
-                    removeDeviceState(mac)
-                    updateConnectButton()
-                    return@launch
+                if (!prof.hasInited()) {
+                    setStatus("Connected, init ...")
+                    // batch 15 samples/channel, 30 s init timeout, battery poll 60 s
+                    if (!prof.init(15, 30000, 60000)) {
+                        appLog("App: failed to initialize ${dev?.name ?: ""} ($mac)", "E", prof)
+                        setStatus("Init failed")
+                        removeDeviceState(mac)
+                        updateConnectButton()
+                        return@launch
+                    }
                 }
                 val info = prof.getDeviceInfo()
                 st.info = info
@@ -1299,7 +1323,7 @@ class MainActivity : Activity() {
                 // The just-connected device becomes the current one.
                 setCurrentDevice(mac)
 
-                if (!prof.startDataNotification()) {
+                if (!prof.isDataTransfering() && !prof.startDataNotification()) {
                     appLog("App: failed to start data stream on $mac", "E", prof)
                     setStatus("startDataNotification failed")
                     updateConnectButton()
@@ -1309,10 +1333,31 @@ class MainActivity : Activity() {
                 clearDataViews(st)
                 appLog("App: device connected and streaming: ${dev?.name ?: ""} ($mac)", "I", prof)
                 setStatus("Streaming $mac ...")
+                if (restoreParams) {
+                    for ((key, value) in savedParamsByMac[mac].orEmpty()) {
+                        val result = prof.setParam(key, value)
+                        prof.log("App: restore setParam($key, $value) -> $result", "I")
+                    }
+                    syncSwitches(prof)
+                    syncSampleRateControl(prof)
+                }
             } finally {
                 updateConnectButton()
             }
         }
+    }
+
+    // Auto-reconnect: the app drives the normal connect flow itself.
+    private fun pressConnectForAutoReconnect(mac: String, restore: Boolean) {
+        val idx = rowMacs.indexOf(mac)
+        if (idx >= 0) {
+            selectedMac = mac
+            deviceListView.setSelection(idx)
+            selectedText.text =
+                "Selected: ${sortedDevices.getOrNull(idx)?.name ?: "replay"} [$mac]"
+            listAdapter.notifyDataSetChanged()
+        }
+        connectDevice(mac, restoreParams = restore)
     }
 
     private fun attachListeners(st: DeviceUiState) {
@@ -1333,6 +1378,11 @@ class MainActivity : Activity() {
                     setStatus("State -> ${DeviceState.nameOf(newState)}")
                 }
             }
+        }
+        p.setOnAutoReconnectListener { _, hasLastSession, answer ->
+            p.log("App: auto reconnect callback received, restore=$hasLastSession", "I")
+            mainHandler.post { pressConnectForAutoReconnect(mac, hasLastSession) }
+            answer.answer(true)
         }
         p.setOnErrorListener { _, errorMsg ->
             p.log("App: error callback: $errorMsg", "E")
@@ -1510,6 +1560,12 @@ class MainActivity : Activity() {
 
     // ---- NTF / FILTER switches (suspend setParam / getParam) -----------------
 
+    // Records a successful setParam for the auto-reconnect restore.
+    private fun recordSavedParam(mac: String, key: String, value: String, result: String) {
+        if (result.startsWith("Error")) return
+        savedParamsByMac.getOrPut(mac) { mutableMapOf() }[key] = value
+    }
+
     private fun onNtfToggled(key: String, on: Boolean) {
         if (suppressNtfCallbacks) return
         val st = currentState()
@@ -1519,6 +1575,7 @@ class MainActivity : Activity() {
             val result = p.setParam(key, if (on) "ON" else "OFF")
             setStatus("setParam $key=${if (on) "ON" else "OFF"} -> $result")
             appLog("User: setParam($key, ${if (on) "ON" else "OFF"}) -> $result")
+            recordSavedParam(st.mac, key, if (on) "ON" else "OFF", result)
             // Re-query all switches after every toggle.
             syncSwitches(p)
         }
@@ -1533,6 +1590,7 @@ class MainActivity : Activity() {
             val result = p.setParam(key, if (on) "ON" else "OFF")
             setStatus("setParam $key=${if (on) "ON" else "OFF"} -> $result")
             appLog("User: setParam($key, ${if (on) "ON" else "OFF"}) -> $result")
+            recordSavedParam(st.mac, key, if (on) "ON" else "OFF", result)
             syncSwitches(p)
         }
     }
@@ -1597,9 +1655,92 @@ class MainActivity : Activity() {
     private fun applySdkDebugLog() {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val version = controller.version.replace('.', '_')
-        controller.setLogPath(true, "/sdcard/Documents/sensorsdklog/${stamp}_$version")
+        sessionLogDir = "/sdcard/Documents/sensorsdklog/${stamp}_$version"
+        controller.setLogPath(true, sessionLogDir!!)
         controller.setDebugEnabled(true)
-        Log.i(TAG, "setLogPath -> /sdcard/Documents/sensorsdklog/${stamp}_$version")
+        Log.i(TAG, "setLogPath -> $sessionLogDir")
+    }
+
+    private fun defaultReplayPath(): String {
+        val dir = sessionLogDir ?: getExternalFilesDir(null)?.absolutePath ?: "/sdcard"
+        return "$dir/test.bin"
+    }
+
+    private fun pickReplayFile() {
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(
+                Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "*/*"
+                    initialReplayDirUri()?.let {
+                        putExtra(DocumentsContract.EXTRA_INITIAL_URI, it)
+                    }
+                }, REQUEST_PICK_REPLAY_FILE)
+        } catch (e: Exception) {
+            setStatus("File picker unavailable: ${e.message}")
+        }
+    }
+
+    // Initial picker location: the session debug log dir.
+    private fun initialReplayDirUri(): Uri? {
+        val dir = sessionLogDir ?: getExternalFilesDir(null)?.absolutePath ?: return null
+        val rel = dir.removePrefix("/sdcard/")
+        if (rel == dir) return null
+        return try {
+            val tree = DocumentsContract.buildTreeDocumentUri(
+                "com.android.externalstorage.documents", "primary:$rel")
+            DocumentsContract.buildDocumentUriUsingTree(
+                tree, DocumentsContract.getTreeDocumentId(tree))
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_PICK_REPLAY_FILE || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        val path = importReplayFile(uri)
+        if (path == null) {
+            setStatus("Unsupported file: $uri")
+            return
+        }
+        replayPathEdit.setText(path)
+        startReplay(path, true)
+    }
+
+    // "primary:Download/x.bin" -> "/sdcard/Download/x.bin" when reachable,
+    // otherwise the content is copied into the app cache dir.
+    private fun importReplayFile(uri: Uri): String? {
+        val docId = try {
+            DocumentsContract.getDocumentId(uri)
+        } catch (e: Exception) {
+            null
+        }
+        if (docId != null) {
+            val split = docId.split(':', limit = 2)
+            if (split.size == 2) {
+                val path = if (split[0].equals("primary", ignoreCase = true)) {
+                    "/sdcard/${split[1]}"
+                } else {
+                    "/storage/${split[0]}/${split[1]}"
+                }
+                if (File(path).exists()) return path
+            }
+        }
+        return try {
+            val name = (uri.lastPathSegment ?: "picked.bin").substringAfterLast('/')
+                .substringAfterLast(':').ifEmpty { "picked.bin" }
+            val out = File(cacheDir, name)
+            contentResolver.openInputStream(uri)?.use { input ->
+                out.outputStream().use { input.copyTo(it) }
+            } ?: return null
+            out.absolutePath
+        } catch (e: Exception) {
+            null
+        }
     }
 
     // Live (non-replay) states whose link is Ready.
@@ -1660,6 +1801,7 @@ class MainActivity : Activity() {
             val result = p.setParam("EEG_SAMPLE_RATE", rate.toString())
             setStatus("setParam EEG_SAMPLE_RATE=$rate -> $result")
             appLog("User: setParam(EEG_SAMPLE_RATE, $rate) -> $result")
+            recordSavedParam(st.mac, "EEG_SAMPLE_RATE", rate.toString(), result)
             // Re-query so the buttons track the device state after the switch.
             syncSampleRateControl(p)
         }
