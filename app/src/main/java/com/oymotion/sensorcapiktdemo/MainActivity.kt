@@ -57,13 +57,13 @@ private const val UI_REFRESH_INTERVAL_MS = 50L
 private const val DATA_QUEUE_CAPACITY = 1000
 
 // Spectrum recompute interval (ms).
-private const val FFT_UPDATE_INTERVAL_MS = 500L
+private const val FFT_UPDATE_INTERVAL_MS = 200L
 
 // File picker request code.
 private const val REQUEST_PICK_REPLAY_FILE = 42
 
 // The demo's own version, shown in the title.
-private const val DEMO_VERSION = "0.1.13"
+private const val DEMO_VERSION = "0.1.19"
 
 // EEG sample rate options offered on the Device page (Hz).
 private val SAMPLE_RATE_CANDIDATES = listOf(250, 500, 1000, 2000)
@@ -214,6 +214,8 @@ class MainActivity : Activity() {
         lateinit var bioHeader: TextView
         lateinit var bioContainer: LinearLayout
         lateinit var bioSlots: List<WaveformView>
+        lateinit var bioSpectra: List<SpectrumView>
+        lateinit var bioSpectrumFeeds: List<SpectrumFeed>
         lateinit var imuPage: LinearLayout
         lateinit var accView: WaveformView
         lateinit var gyroView: WaveformView
@@ -377,6 +379,18 @@ class MainActivity : Activity() {
         // Default to the session debug log dir.
         replayPathEdit.setText(defaultReplayPath())
         controller.registerBleBridge(applicationContext)
+        controller.setOnScanResultListener { found ->
+            runOnUiThread { mergeDevices(found) }
+        }
+        controller.setOnEnableChangedListener { enabled ->
+            runOnUiThread {
+                if (!enabled) {
+                    scanning = false
+                    scanBtn.text = "Start Scan"
+                    setStatus("Bluetooth turned off")
+                }
+            }
+        }
         setStatus("SDK version: ${controller.version}")
 
         requestBlePermissions()
@@ -413,7 +427,7 @@ class MainActivity : Activity() {
 
         val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         scanBtn = Button(this).apply {
-            text = "Scan"
+            text = "Start Scan"
             setOnClickListener { toggleScan() }
         }
         connectBtn = Button(this).apply {
@@ -720,11 +734,26 @@ class MainActivity : Activity() {
         st.bioContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         st.bioPage.addView(st.bioHeader)
         st.bioPage.addView(st.bioContainer, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
-        st.bioSlots = (0 until BIO_SLOT_COUNT).map {
-            val v = WaveformView(this, viewChannels = 1, capacity = 1250)
-            st.bioContainer.addView(v, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
-            v
+        // One row per slot: [spectrum | waveform] 50/50 in split rows; a
+        // hidden spectrum leaves the waveform full-width.
+        val slots = ArrayList<WaveformView>()
+        val spectra = ArrayList<SpectrumView>()
+        for (i in 0 until BIO_SLOT_COUNT) {
+            val spectrum = SpectrumView(this)
+            spectrum.visibility = View.GONE
+            val waveform = WaveformView(this, viewChannels = 1, capacity = 1250)
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(spectrum, LinearLayout.LayoutParams(0, MATCH_PARENT, 1f))
+                addView(waveform, LinearLayout.LayoutParams(0, MATCH_PARENT, 1f))
+            }
+            st.bioContainer.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+            slots.add(waveform)
+            spectra.add(spectrum)
         }
+        st.bioSlots = slots
+        st.bioSpectra = spectra
+        st.bioSpectrumFeeds = slots.mapIndexed { i, v -> SpectrumFeed(v, spectra[i]) }
         showBioPlaceholder(st, "Waiting for data ...")
 
         st.imuPage = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -749,14 +778,21 @@ class MainActivity : Activity() {
         st.eulerSpectrum = SpectrumView(this).apply { labels = eulerLabels }
         st.quatSpectrum = SpectrumView(this).apply { labels = quatLabels }
         st.cubeView = CubeView(this)
-        st.imuPage.addView(st.accView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
-        st.imuPage.addView(st.accSpectrum, LinearLayout.LayoutParams(MATCH_PARENT, 0, 0.5f))
-        st.imuPage.addView(st.gyroView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
-        st.imuPage.addView(st.gyroSpectrum, LinearLayout.LayoutParams(MATCH_PARENT, 0, 0.5f))
-        st.imuPage.addView(st.eulerView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
-        st.imuPage.addView(st.eulerSpectrum, LinearLayout.LayoutParams(MATCH_PARENT, 0, 0.5f))
-        st.imuPage.addView(st.quatView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
-        st.imuPage.addView(st.quatSpectrum, LinearLayout.LayoutParams(MATCH_PARENT, 0, 0.5f))
+        // One row per pair: [spectrum | waveform] 50/50, same as the bio rows.
+        val imuPairs = listOf(
+            st.accSpectrum to st.accView,
+            st.gyroSpectrum to st.gyroView,
+            st.eulerSpectrum to st.eulerView,
+            st.quatSpectrum to st.quatView,
+        )
+        for ((spectrum, waveform) in imuPairs) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(spectrum, LinearLayout.LayoutParams(0, MATCH_PARENT, 1f))
+                addView(waveform, LinearLayout.LayoutParams(0, MATCH_PARENT, 1f))
+            }
+            st.imuPage.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        }
         st.imuPage.addView(st.cubeView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 2f).apply {
             val m = dp(8)
             setMargins(m, m, m, m)
@@ -862,20 +898,36 @@ class MainActivity : Activity() {
             v.placeholder = text
             v.sideText = ""
         }
+        for (v in st.bioSpectra) {
+            v.visibility = View.GONE
+            v.clear()
+        }
     }
 
-    // Binds one bio slot to a (stream, channel) source.
+    // Binds one bio slot to a (stream, channel) source; withSpectrum shows
+    // the slot's spectrum half.
     private fun bindSlot(st: DeviceUiState, slot: Int, dataType: Int, channel: Int,
                          label: String, colorIndex: Int, impKind: Int,
-                         feeds: MutableList<BioFeed>) {
+                         feeds: MutableList<BioFeed>, withSpectrum: Boolean = false) {
         val v = st.bioSlots[slot]
         val feed = BioFeed(v, dataType, channel, impKind, channel)
-        if (st.slotFeeds[slot] != feed) v.clear()
+        if (st.slotFeeds[slot] != feed) {
+            v.clear()
+            st.bioSpectra[slot].clear()
+        }
         st.slotFeeds[slot] = feed
         v.title = label
         v.colorIndex = colorIndex
         v.placeholder = ""
         v.sideText = ""
+        val spectrum = st.bioSpectra[slot]
+        if (withSpectrum) {
+            spectrum.labels = arrayOf(label)
+            spectrum.colorIndex = colorIndex
+            spectrum.visibility = View.VISIBLE
+        } else {
+            spectrum.visibility = View.GONE
+        }
         feeds.add(feed)
     }
 
@@ -887,6 +939,8 @@ class MainActivity : Activity() {
         v.colorIndex = -1
         v.placeholder = placeholder
         v.sideText = ""
+        st.bioSpectra[slot].visibility = View.GONE
+        st.bioSpectra[slot].clear()
     }
 
     // Re-layouts one device's bio slots for one mode.
@@ -904,7 +958,8 @@ class MainActivity : Activity() {
                 val count = minOf(if (emgCh > 0) emgCh else 0, BIO_SLOT_COUNT)
                 for (i in 0 until BIO_SLOT_COUNT) {
                     if (i < count) {
-                        bindSlot(st, i, DataType.NTF_EMG, i, "EMG-${i + 1}", i, IMP_EMG, feeds)
+                        bindSlot(st, i, DataType.NTF_EMG, i, "EMG-${i + 1}", i, IMP_EMG,
+                            feeds, withSpectrum = true)
                     } else {
                         unbindSlot(st, i, waiting)
                     }
@@ -923,9 +978,11 @@ class MainActivity : Activity() {
                 for (i in 0 until BIO_SLOT_COUNT) {
                     val ch = startCh + i
                     if (i < perPage && ch < eegCh) {
-                        bindSlot(st, i, DataType.NTF_EEG, ch, "EEG-${ch + 1}", ch, IMP_EEG, feeds)
+                        bindSlot(st, i, DataType.NTF_EEG, ch, "EEG-${ch + 1}", ch, IMP_EEG,
+                            feeds, withSpectrum = true)
                     } else if (hasECG && i == ecgIndex) {
-                        bindSlot(st, i, DataType.NTF_ECG, 0, "ECG", -1, IMP_ECG, feeds)
+                        bindSlot(st, i, DataType.NTF_ECG, 0, "ECG", -1, IMP_ECG, feeds,
+                            withSpectrum = true)
                     } else if (hasBRTH && i == brthIndex) {
                         bindSlot(st, i, DataType.NTF_BRTH, 0, "BRTH", -1, IMP_BRTH, feeds)
                     } else {
@@ -957,7 +1014,10 @@ class MainActivity : Activity() {
                         }
                         if (ch < available) {
                             val imp = if (type == DataType.NTF_EEG) IMP_EEG else -1
-                            bindSlot(st, i, type, ch, labels[i], i, imp, feeds)
+                            // SpO2 rows (low-rate derived values) stay
+                            // full-width.
+                            bindSlot(st, i, type, ch, labels[i], i, imp, feeds,
+                                withSpectrum = type != DataType.NTF_SPO2)
                         } else {
                             unbindSlot(st, i, waiting)
                         }
@@ -1064,38 +1124,47 @@ class MainActivity : Activity() {
         showBioPlaceholder(st, "Waiting for data ...")
     }
 
-    // FFT spectra of the current device's IMU waveforms, computed on the
-    // worker executor.
+    // FFT spectra of the current device's IMU waveforms and split bio rows,
+    // computed on the worker executor.
     private fun maybeSubmitSpectra() {
         val st = currentState() ?: return
         val now = System.currentTimeMillis()
         val session = st.dataSession
-        for (feed in st.spectrumFeeds) {
-            if (feed.inFlight.get() || now - feed.lastSubmitMs < FFT_UPDATE_INTERVAL_MS) continue
-            // Skips rings that have not received data yet (rate unknown).
-            val snap = feed.view.snapshotForSpectrum() ?: continue
-            feed.lastSubmitMs = now
-            feed.inFlight.set(true)
-            try {
-                fftExecutor.execute {
-                    val result = try {
-                        SpectrumCompute.compute(snap.channels, snap.rate)
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "spectrum compute failed", t)
-                        null
-                    }
-                    mainHandler.post {
-                        feed.inFlight.set(false)
-                        if (session == st.dataSession &&
-                            snap.generation == feed.view.ringGeneration) {
-                            if (result != null) feed.spectrum.setResult(result.freqs, result.mags)
-                            else feed.spectrum.clear()
-                        }
+        for (feed in st.spectrumFeeds) submitSpectrum(st, feed, session, now)
+        for (feed in st.bioSpectrumFeeds) {
+            // Split rows only.
+            if (feed.spectrum.visibility == View.VISIBLE) {
+                submitSpectrum(st, feed, session, now)
+            }
+        }
+    }
+
+    // One spectrum strip compute, throttled per strip.
+    private fun submitSpectrum(st: DeviceUiState, feed: SpectrumFeed, session: Int, now: Long) {
+        if (feed.inFlight.get() || now - feed.lastSubmitMs < FFT_UPDATE_INTERVAL_MS) return
+        // Skips rings that have not received data yet (rate unknown).
+        val snap = feed.view.snapshotForSpectrum() ?: return
+        feed.lastSubmitMs = now
+        feed.inFlight.set(true)
+        try {
+            fftExecutor.execute {
+                val result = try {
+                    SpectrumCompute.compute(snap.channels, snap.rate)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "spectrum compute failed", t)
+                    null
+                }
+                mainHandler.post {
+                    feed.inFlight.set(false)
+                    if (session == st.dataSession &&
+                        snap.generation == feed.view.ringGeneration) {
+                        if (result != null) feed.spectrum.setResult(result.freqs, result.mags)
+                        else feed.spectrum.clear()
                     }
                 }
-            } catch (e: RejectedExecutionException) {
-                feed.inFlight.set(false)
             }
+        } catch (e: RejectedExecutionException) {
+            feed.inFlight.set(false)
         }
     }
 
@@ -1133,34 +1202,25 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---- scan (suspend extension in a loop) -----------------------------------
+    // ---- scan (startScan + OnScanResultListener) ----------------------------
 
     private fun toggleScan() {
-        if (scanning) {
+        if (controller.isScanning) {
             appLog("Stop scan")
-            scanning = false
             controller.stopScan()
-            scanBtn.text = "Scan"
+            scanning = false
+            scanBtn.text = "Start Scan"
             setStatus("Scan stopped (${devices.size} devices)")
         } else {
-            appLog("User: start scan")
-            scanning = true
-            scanBtn.text = "Stop Scan"
-            setStatus("Scanning ...")
-            scope.launch {
-                // Repeated scan() rounds.
-                while (scanning) {
-                    if (!controller.isEnable) {
-                        appLog("User: start scan rejected (Bluetooth disabled)", "W")
-                        setStatus("Bluetooth is off")
-                        break
-                    }
-                    val found = controller.scan(5000)
-                    mergeDevices(found)
-                }
-                scanning = false
-                scanBtn.text = "Scan"
+            if (!controller.isEnable) {
+                appLog("User: start scan rejected (Bluetooth disabled)", "W")
+                setStatus("Bluetooth is not enabled")
+                return
             }
+            appLog("User: start scan")
+            scanning = controller.startScan(3000)
+            scanBtn.text = if (scanning) "Stop Scan" else "Start Scan"
+            setStatus(if (scanning) "Scanning ..." else "Error: start scan failed")
         }
     }
 
@@ -1171,7 +1231,6 @@ class MainActivity : Activity() {
         }
         sortedDevices = devices.values.sortedByDescending { it.rssi }
         refreshDeviceList()
-        setStatus("Devices: ${sortedDevices.size}")
     }
 
     // Rebuilds the list rows.
@@ -1242,7 +1301,7 @@ class MainActivity : Activity() {
         if (scanning) {
             scanning = false
             controller.stopScan()
-            scanBtn.text = "Scan"
+            scanBtn.text = "Start Scan"
         }
         connectBtn.isEnabled = false
         scope.launch {
@@ -2321,6 +2380,7 @@ class MainActivity : Activity() {
         st.dataSession++
         st.liveFilter.reset()
         for (v in st.bioSlots) v.clear()
+        for (v in st.bioSpectra) v.clear()
         st.accView.clear()
         st.gyroView.clear()
         st.eulerView.clear()

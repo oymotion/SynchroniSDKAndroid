@@ -316,6 +316,10 @@ profile.setParam("DEBUG_BLE_DATA_PATH", "True")
 // Per-profile log file in the SDK log directory ("True"), or an absolute
 // custom path; "False"/"" disables
 profile.setParam("DEBUG_LOG_PATH", "True")
+
+// Flush this device's pending bin capture and SDK log to disk; the value
+// is ignored
+profile.setParam("FLUSH_BLE_DATA", "")
 ```
 
 Aggregate queries via `getParam(key)`:

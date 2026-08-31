@@ -113,6 +113,9 @@ class SpectrumView(context: Context) : View(context) {
     // Per-channel labels drawn top-left.
     @Volatile var labels: Array<String> = emptyArray()
 
+    // Curve color palette override; -1 = follow the channel index.
+    @Volatile var colorIndex = -1
+
     // Channel colors.
     private val channelColors = intArrayOf(
         Color.rgb(0, 200, 200), Color.rgb(230, 80, 200), Color.rgb(230, 210, 60),
@@ -207,7 +210,8 @@ class SpectrumView(context: Context) : View(context) {
         canvas.clipRect(plotL, plotT, plotR, plotB)
         for (ch in m.indices) {
             val row = m[ch]
-            val color = channelColors[ch % channelColors.size]
+            val colorIdx = if (colorIndex >= 0) colorIndex else ch
+            val color = channelColors[colorIdx % channelColors.size]
             path.rewind()
             val count = minOf(row.size, f.size)
             for (i in 0 until count) {
