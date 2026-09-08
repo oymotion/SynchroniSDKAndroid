@@ -27,7 +27,6 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.RadioButton
-import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
@@ -63,10 +62,13 @@ private const val FFT_UPDATE_INTERVAL_MS = 200L
 private const val REQUEST_PICK_REPLAY_FILE = 42
 
 // The demo's own version, shown in the title.
-private const val DEMO_VERSION = "0.1.19"
+private const val DEMO_VERSION = "0.1.24"
 
-// EEG sample rate options offered on the Device page (Hz).
+// Sample rate options offered on the Device page (Hz).
 private val SAMPLE_RATE_CANDIDATES = listOf(250, 500, 1000, 2000)
+private val EMG_SAMPLE_RATE_CANDIDATES = listOf(500, 1000)
+private val IMU_SAMPLE_RATE_CANDIDATES = listOf(50, 100, 200, 250, 400, 500, 1000, 2000)
+private val PPG_SAMPLE_RATE_CANDIDATES = listOf(50, 100, 200, 400, 800, 1000, 1600, 3200)
 
 // Battery reading stable band (%).
 private const val POWER_STABLE_BAND = 4
@@ -206,6 +208,9 @@ class MainActivity : Activity() {
         // Per-device bio live filter.
         val liveFilter = LiveFilter()
 
+        // Cached sample-rate control state: param key -> (options, current).
+        val sampleRateStates = HashMap<String, Pair<List<Int>, Int>>()
+
         // Bumped on every clearDataViews.
         @Volatile var dataSession = 0
 
@@ -288,7 +293,12 @@ class MainActivity : Activity() {
     private lateinit var pauseReplayBtn: Button
     private lateinit var stopReplayBtn: Button
     private lateinit var analyzeBtn: Button
-    private lateinit var sampleRateGroup: RadioGroup
+    private lateinit var eegSampleRate: SampleRateControl
+    private lateinit var emgSampleRate: SampleRateControl
+    private lateinit var imuSampleRate: SampleRateControl
+    private lateinit var ppgSampleRate: SampleRateControl
+    private val sampleRateControls
+        get() = listOf(eegSampleRate, emgSampleRate, imuSampleRate, ppgSampleRate)
     private val ntfChecks = LinkedHashMap<String, CheckBox>()
     private val filterChecks = LinkedHashMap<String, CheckBox>()
 
@@ -299,13 +309,14 @@ class MainActivity : Activity() {
     private lateinit var pageLabel: TextView
 
     private val devices = LinkedHashMap<String, BleDevice>()
-    private var sortedDevices: List<BleDevice> = emptyList()
+    private val sortedDevices = ArrayList<BleDevice>()
+    // Consecutive scan rounds each mac was absent (three-round eviction).
+    private val absentRounds = HashMap<String, Int>()
     private var selectedMac: String? = null
 
     @Volatile private var scanning = false
     @Volatile private var cloneData = false
     private var suppressNtfCallbacks = false
-    private var suppressSampleRateCallbacks = false
 
     // Session-wide toggles.
     private var autoReconnect = true
@@ -419,6 +430,75 @@ class MainActivity : Activity() {
         tabButtons.forEachIndexed { i, b -> b.isEnabled = i != index }
     }
 
+    // One labeled sample-rate radio row (wrapping FlowLayout of radios).
+    private inner class SampleRateControl(
+        val key: String,
+        label: String,
+        candidates: List<Int>,
+    ) {
+        val row = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        val radios = LinkedHashMap<Int, RadioButton>()
+        private var suppress = false
+
+        init {
+            row.addView(TextView(this@MainActivity).apply {
+                text = label
+                textSize = 13f
+            })
+            val flow = FlowLayout(this@MainActivity).apply {
+                horizontalSpacing = dp(8)
+                verticalSpacing = dp(0)
+            }
+            for (rate in candidates) {
+                val rb = RadioButton(this@MainActivity).apply {
+                    text = "$rate Hz"
+                    isEnabled = false
+                    setOnCheckedChangeListener { _, isChecked ->
+                        if (isChecked && !suppress) {
+                            check(rate)
+                            onSampleRateSelected(key, rate)
+                        }
+                    }
+                }
+                radios[rate] = rb
+                flow.addView(rb, ViewGroup.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+            }
+            row.addView(flow)
+        }
+
+        // Checked state only.
+        fun check(rate: Int) {
+            suppress = true
+            for ((r, rb) in radios) rb.isChecked = (r == rate)
+            suppress = false
+        }
+
+        // Options + current rate sync.
+        fun sync(options: List<Int>, current: Int) {
+            row.visibility = if (options.isEmpty()) View.GONE else View.VISIBLE
+            suppress = true
+            for ((r, rb) in radios) {
+                val supported = r in options
+                rb.visibility = if (supported) View.VISIBLE else View.GONE
+                rb.isEnabled = supported
+                rb.isChecked = r == current
+            }
+            suppress = false
+        }
+
+        fun greyOut() {
+            suppress = true
+            for (rb in radios.values) {
+                rb.isEnabled = false
+                rb.isChecked = false
+            }
+            suppress = false
+        }
+    }
+
     private fun buildDevicePage(): View {
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -444,7 +524,7 @@ class MainActivity : Activity() {
         multiBtn = Button(this).apply {
             text = "Multi Start"
             isEnabled = false
-            setOnClickListener { onMultiStart() }
+            setOnClickListener { onMultiSyncClicked() }
         }
         multiRow.addView(multiBtn, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         page.addView(multiRow)
@@ -563,27 +643,12 @@ class MainActivity : Activity() {
         }
         page.addView(filterRow)
 
-        // EEG sample rate options.
-        val srRow = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val srLabel = TextView(this).apply {
-            text = "EEG Sample Rate"
-            textSize = 13f
-        }
-        srRow.addView(srLabel)
-        sampleRateGroup = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
-        for (rate in SAMPLE_RATE_CANDIDATES) {
-            val rb = RadioButton(this).apply {
-                text = "$rate Hz"
-                id = rate
-                isEnabled = false
-            }
-            sampleRateGroup.addView(rb)
-        }
-        sampleRateGroup.setOnCheckedChangeListener { _, checkedId ->
-            onSampleRateSelected(checkedId)
-        }
-        srRow.addView(sampleRateGroup)
-        page.addView(srRow)
+        // Sample rate options.
+        eegSampleRate = SampleRateControl("EEG_SAMPLE_RATE", "EEG Sample Rate", SAMPLE_RATE_CANDIDATES)
+        emgSampleRate = SampleRateControl("EMG_SAMPLE_RATE", "EMG Sample Rate", EMG_SAMPLE_RATE_CANDIDATES)
+        imuSampleRate = SampleRateControl("IMU_SAMPLE_RATE", "IMU Sample Rate", IMU_SAMPLE_RATE_CANDIDATES)
+        ppgSampleRate = SampleRateControl("PPG_SAMPLE_RATE", "PPG Sample Rate", PPG_SAMPLE_RATE_CANDIDATES)
+        for (c in sampleRateControls) page.addView(c.row)
 
         // Gesture readout.
         gestureText = TextView(this).apply {
@@ -856,10 +921,10 @@ class MainActivity : Activity() {
             if (st.isReplay) {
                 // No parameter control over a replay session.
                 greyOutControls()
-                syncSampleRateChecked(st.info?.eegSampleRate ?: 0f)
+                syncSampleRateCheckedFromInfo(st, st.info)
             } else if (st.profile != null) {
                 syncSwitches(st.profile)
-                syncSampleRateControl(st.profile)
+                syncSampleRateControls(st.profile)
             }
         }
         updatePageControls()
@@ -880,12 +945,7 @@ class MainActivity : Activity() {
             cb.isChecked = false
         }
         suppressNtfCallbacks = false
-        suppressSampleRateCallbacks = true
-        for (i in 0 until sampleRateGroup.childCount) {
-            sampleRateGroup.getChildAt(i).isEnabled = false
-        }
-        sampleRateGroup.clearCheck()
-        suppressSampleRateCallbacks = false
+        for (c in sampleRateControls) c.greyOut()
     }
 
     // Idle state of one device's bio page: all slots unbound, placeholder.
@@ -1066,7 +1126,7 @@ class MainActivity : Activity() {
         val newPage = (st.bioPageIndex + delta).coerceIn(0, pages - 1)
         if (newPage == st.bioPageIndex) return
         st.bioPageIndex = newPage
-        appLog("User: ${if (delta < 0) "prev" else "next"} page -> $newPage", "D")
+        appLog("User: ${if (delta < 0) "prev" else "next"} page -> $newPage", "D", st.profile)
         val c = st.lastBioCounts
         layoutBio(st, BioMode.EEG, c[0], c[1], c[2], c[3], c[4], c[5])
     }
@@ -1218,18 +1278,59 @@ class MainActivity : Activity() {
                 return
             }
             appLog("User: start scan")
-            scanning = controller.startScan(3000)
+            scanning = controller.startScan(6000)
             scanBtn.text = if (scanning) "Stop Scan" else "Start Scan"
             setStatus(if (scanning) "Scanning ..." else "Error: start scan failed")
         }
     }
 
     private fun mergeDevices(found: List<BleDevice>) {
-        // Repeat results update in place (RSSI refresh), then sort by RSSI.
+        // New entries insert at their RSSI-sorted position; known entries
+        // refresh in place and keep their position.
+        val seen = HashSet<String>()
         for (d in found) {
-            if (d.mac.isNotEmpty()) devices[d.mac] = d
+            if (d.mac.isEmpty()) continue
+            seen.add(d.mac)
+            val idx = sortedDevices.indexOfFirst { it.mac == d.mac }
+            if (idx >= 0) {
+                sortedDevices[idx] = d
+            } else {
+                var pos = sortedDevices.indexOfFirst { it.rssi < d.rssi }
+                if (pos < 0) pos = sortedDevices.size
+                sortedDevices.add(pos, d)
+            }
+            devices[d.mac] = d
         }
-        sortedDevices = devices.values.sortedByDescending { it.rssi }
+        // Three-round absence eviction; connected devices and replay members
+        // stay.
+        var evicted = false
+        val it = sortedDevices.iterator()
+        while (it.hasNext()) {
+            val d = it.next()
+            if (d.mac in seen) {
+                absentRounds[d.mac] = 0
+                continue
+            }
+            val st = synchronized(deviceStates) { deviceStates[d.mac] }
+            val exempt = (st != null && !st.isReplay) || d.mac == replayMac ||
+                    replayMacs.contains(d.mac)
+            if (exempt) {
+                absentRounds[d.mac] = 0
+                continue
+            }
+            val rounds = (absentRounds[d.mac] ?: 0) + 1
+            if (rounds < 4) {
+                absentRounds[d.mac] = rounds
+                continue
+            }
+            it.remove()
+            devices.remove(d.mac)
+            absentRounds.remove(d.mac)
+            evicted = true
+            Log.i(TAG, "scan list: evicted ${d.mac} after $rounds absent rounds")
+            if (d.mac == currentMac) setCurrentDevice(null)
+        }
+        if (evicted) updateConnectButton()
         refreshDeviceList()
     }
 
@@ -1303,13 +1404,19 @@ class MainActivity : Activity() {
             controller.stopScan()
             scanBtn.text = "Start Scan"
         }
+        // No live connect while a replay is running.
+        if (replayMac != null || replayMacs.isNotEmpty()) {
+            appLog("User: connect rejected (replay running)", "W")
+            setStatus("Connect refused while a replay is running")
+            return
+        }
         connectBtn.isEnabled = false
         scope.launch {
             try {
                 val dev = devices[mac]
-                appLog("User: connect ${dev?.name ?: ""} ($mac)")
                 setStatus("Connecting ${dev?.name ?: ""} [$mac] ...")
                 val prof = controller.requireSensor(mac)
+                appLog("User: connect ${dev?.name ?: ""} ($mac)", "I", prof)
                 if (prof == null) {
                     appLog("App: failed to create SensorProfile for $mac", "E")
                     setStatus("requireSensor failed")
@@ -1334,8 +1441,8 @@ class MainActivity : Activity() {
                 }
                 if (!prof.hasInited()) {
                     setStatus("Connected, init ...")
-                    // batch 15 samples/channel, 30 s init timeout, battery poll 60 s
-                    if (!prof.init(15, 30000, 60000)) {
+                    // batch 32 samples/channel, 5 s init timeout, battery poll 60 s
+                    if (!prof.init(32, 5000, 60000)) {
                         appLog("App: failed to initialize ${dev?.name ?: ""} ($mac)", "E", prof)
                         setStatus("Init failed")
                         removeDeviceState(mac)
@@ -1385,6 +1492,7 @@ class MainActivity : Activity() {
                 if (!prof.isDataTransfering() && !prof.startDataNotification()) {
                     appLog("App: failed to start data stream on $mac", "E", prof)
                     setStatus("startDataNotification failed")
+                    removeDeviceState(mac)
                     updateConnectButton()
                     return@launch
                 }
@@ -1398,7 +1506,7 @@ class MainActivity : Activity() {
                         prof.log("App: restore setParam($key, $value) -> $result", "I")
                     }
                     syncSwitches(prof)
-                    syncSampleRateControl(prof)
+                    syncSampleRateControls(prof)
                 }
             } finally {
                 updateConnectButton()
@@ -1429,7 +1537,7 @@ class MainActivity : Activity() {
                     // drops. The event also fires after a failed connect
                     // already removed the state; skip the log then.
                     if (synchronized(deviceStates) { deviceStates.containsKey(mac) }) {
-                        appLog("App: device disconnected, removed from UI: $mac")
+                        appLog("App: device disconnected, removed from UI: $mac", "I", st.profile)
                     }
                     removeDeviceState(mac)
                     if (currentMac == null) setStatus("Disconnected $mac")
@@ -1461,16 +1569,20 @@ class MainActivity : Activity() {
         p.setOnDeviceInfoUpdateListener { _, info ->
             // Fired after the cached DeviceInfo changed.
             st.info = info
+            seedSampleRateCurrent(st, info)
             mainHandler.post {
                 syncSampleRateBuffers(st, info)
-                if (mac == currentMac) updateLinkInfo(info)
+                if (mac == currentMac) {
+                    updateLinkInfo(info)
+                    applyCheckedFromCache(st)
+                }
             }
         }
         p.setOnDataTransferStateChangeListener { _, isTransferring ->
             // Stream on/off signal.
             st.transferring = isTransferring
             appLog("App: data stream ${if (isTransferring) "ON" else "OFF"} $mac", "I", p)
-            mainHandler.post { refreshDeviceList() }
+            mainHandler.post { refreshDeviceList(); updateConnectButton() }
         }
         p.setOnDataListener { _, dataList -> onSensorData(mac, dataList) }
     }
@@ -1515,12 +1627,25 @@ class MainActivity : Activity() {
         val linked = st != null && !st.isReplay && p != null &&
                 (ds == DeviceState.READY || ds == DeviceState.CONNECTED || ds == DeviceState.CONNECTING)
         connectBtn.text = if (linked) "Disconnect" else "Connect"
-        connectBtn.isEnabled = selectedMac != null && (st == null || !st.isReplay)
+        // No live connect while a replay is running.
+        val replaying = replayMac != null || replayMacs.isNotEmpty()
+        connectBtn.isEnabled =
+            selectedMac != null && (st == null || !st.isReplay) && !replaying
         val states = synchronized(deviceStates) { deviceStates.values.toList() }
-        multiBtn.isEnabled = !multiOpActive && states.any { !it.isReplay }
+        val anyStreaming = states.any { !it.isReplay && it.transferring }
+        multiBtn.text = if (anyStreaming) "Multi Stop" else "Multi Start"
+        multiBtn.isEnabled = !multiOpActive && !replaying && states.any { !it.isReplay }
     }
 
     // ---- synchronized multi-device stream start/stop -------------------------
+
+    // Multi Start/Stop toggle: dispatches by the any-streaming state.
+    private fun onMultiSyncClicked() {
+        val anyStreaming = synchronized(deviceStates) {
+            deviceStates.values.any { !it.isReplay && it.transferring }
+        }
+        if (anyStreaming) onMultiStop() else onMultiStart()
+    }
 
     // Multi Start button.
     private fun onMultiStart() {
@@ -1633,8 +1758,9 @@ class MainActivity : Activity() {
         scope.launch {
             val result = p.setParam(key, if (on) "ON" else "OFF")
             setStatus("setParam $key=${if (on) "ON" else "OFF"} -> $result")
-            appLog("User: setParam($key, ${if (on) "ON" else "OFF"}) -> $result")
+            appLog("User: setParam($key, ${if (on) "ON" else "OFF"}) -> $result", "I", p)
             recordSavedParam(st.mac, key, if (on) "ON" else "OFF", result)
+            if (!result.startsWith("Error")) clearDataViews(st)
             // Re-query all switches after every toggle.
             syncSwitches(p)
         }
@@ -1648,8 +1774,9 @@ class MainActivity : Activity() {
         scope.launch {
             val result = p.setParam(key, if (on) "ON" else "OFF")
             setStatus("setParam $key=${if (on) "ON" else "OFF"} -> $result")
-            appLog("User: setParam($key, ${if (on) "ON" else "OFF"}) -> $result")
+            appLog("User: setParam($key, ${if (on) "ON" else "OFF"}) -> $result", "I", p)
             recordSavedParam(st.mac, key, if (on) "ON" else "OFF", result)
+            if (!result.startsWith("Error")) clearDataViews(st)
             syncSwitches(p)
         }
     }
@@ -1710,14 +1837,14 @@ class MainActivity : Activity() {
 
     // ---- debug log / bin data / auto reconnect toggles ------------------------
 
-    // Applies the session log path + setDebugEnabled(true).
+    // Applies the session log path + DEBUG_ENABLED=True.
     private fun applySdkDebugLog() {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val version = controller.version.replace('.', '_')
         sessionLogDir = "/sdcard/Documents/sensorsdklog/${stamp}_$version"
-        controller.setLogPath(true, sessionLogDir!!)
-        controller.setDebugEnabled(true)
-        Log.i(TAG, "setLogPath -> $sessionLogDir")
+        controller.setParam("LOG_PATH", sessionLogDir!!)
+        controller.setParam("DEBUG_ENABLED", "True")
+        Log.i(TAG, "LOG_PATH -> $sessionLogDir")
     }
 
     private fun defaultReplayPath(): String {
@@ -1817,7 +1944,7 @@ class MainActivity : Activity() {
         if (checked) {
             applySdkDebugLog()
         } else {
-            controller.setDebugEnabled(false)
+            controller.setParam("DEBUG_ENABLED", "False")
         }
         val value = if (checked) "True" else "False"
         for (p in readyProfiles()) {
@@ -1849,48 +1976,72 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---- EEG sample rate control (suspend setParam / getParam) ----------------
+    // ---- sample rate controls (suspend setParam / getParam) ----------------
 
-    private fun onSampleRateSelected(rate: Int) {
-        if (suppressSampleRateCallbacks) return
+    private fun onSampleRateSelected(key: String, rate: Int) {
         val st = currentState()
         val p = st?.profile ?: return
         if (st.isReplay) return
         scope.launch {
-            val result = p.setParam("EEG_SAMPLE_RATE", rate.toString())
-            setStatus("setParam EEG_SAMPLE_RATE=$rate -> $result")
-            appLog("User: setParam(EEG_SAMPLE_RATE, $rate) -> $result")
-            recordSavedParam(st.mac, "EEG_SAMPLE_RATE", rate.toString(), result)
+            val result = p.setParam(key, rate.toString())
+            setStatus("setParam $key=$rate -> $result")
+            appLog("User: setParam($key, $rate) -> $result", "I", p)
+            recordSavedParam(st.mac, key, rate.toString(), result)
+            if (!result.startsWith("Error")) clearDataViews(st)
             // Re-query so the buttons track the device state after the switch.
-            syncSampleRateControl(p)
+            syncSampleRateControls(p)
         }
     }
 
-    // Reads back the EEG sample rate options and the bound rate and syncs
-    // the radio buttons.
-    private fun syncSampleRateControl(p: SensorProfile) {
+    // Reads back the sample rate options and the bound rates, caches them
+    // per device and syncs the radio rows of the current device.
+    private fun syncSampleRateControls(p: SensorProfile) {
         scope.launch {
-            val options = p.getParam("EEG_SAMPLE_RATE_LIST")
-                .split("|").mapNotNull { it.toIntOrNull() }
-            val current = p.getParam("EEG_SAMPLE_RATE").toIntOrNull() ?: 0
-            suppressSampleRateCallbacks = true
-            for (i in 0 until sampleRateGroup.childCount) {
-                val rb = sampleRateGroup.getChildAt(i) as RadioButton
-                rb.isEnabled = rb.id in options
+            val read = LinkedHashMap<String, Pair<List<Int>, Int>>()
+            for (c in sampleRateControls) {
+                val options = p.getParam("${c.key}_LIST")
+                    .split("|").mapNotNull { it.toIntOrNull() }
+                val current = p.getParam(c.key).toIntOrNull() ?: 0
+                read[c.key] = options to current
             }
-            if (current in SAMPLE_RATE_CANDIDATES) sampleRateGroup.check(current)
-            else sampleRateGroup.clearCheck()
-            suppressSampleRateCallbacks = false
+            val st = synchronized(deviceStates) {
+                deviceStates.values.firstOrNull { it.profile === p }
+            }
+            if (st != null) st.sampleRateStates.putAll(read)
+            if (st != null && st.mac == currentMac) {
+                for (c in sampleRateControls) {
+                    val (options, current) = read[c.key] ?: continue
+                    c.sync(options, current)
+                }
+            }
         }
     }
 
-    // Syncs only the CHECKED state of the sample rate radios (replay path).
-    private fun syncSampleRateChecked(rate: Float) {
-        val current = rate.toInt()
-        suppressSampleRateCallbacks = true
-        if (current in SAMPLE_RATE_CANDIDATES) sampleRateGroup.check(current)
-        else sampleRateGroup.clearCheck()
-        suppressSampleRateCallbacks = false
+    // Current rates from DeviceInfo into the per-device cache (> 0 only).
+    private fun seedSampleRateCurrent(st: DeviceUiState, info: DeviceInfo) {
+        seedRate(st, "EEG_SAMPLE_RATE", info.eegSampleRate)
+        seedRate(st, "EMG_SAMPLE_RATE", info.emgSampleRate)
+        seedRate(st, "IMU_SAMPLE_RATE", info.accSampleRate)
+        seedRate(st, "PPG_SAMPLE_RATE", info.ppgSampleRate)
+    }
+
+    private fun seedRate(st: DeviceUiState, key: String, rate: Float) {
+        if (rate <= 0) return
+        val cached = st.sampleRateStates[key]
+        st.sampleRateStates[key] = (cached?.first ?: emptyList()) to rate.toInt()
+    }
+
+    // Checked state of every row from the per-device cache.
+    private fun applyCheckedFromCache(st: DeviceUiState) {
+        for (c in sampleRateControls) {
+            c.check(st.sampleRateStates[c.key]?.second ?: 0)
+        }
+    }
+
+    // Replay path: checked state seeded from the capture's DeviceInfo.
+    private fun syncSampleRateCheckedFromInfo(st: DeviceUiState, info: DeviceInfo?) {
+        if (info != null) seedSampleRateCurrent(st, info)
+        applyCheckedFromCache(st)
     }
 
     // Link/MTU display from DeviceInfo; "--" for values the link did not report.
@@ -1948,6 +2099,11 @@ class MainActivity : Activity() {
             setStatus("Stop the running replay first")
             return
         }
+        if (synchronized(deviceStates) { deviceStates.values.any { !it.isReplay } }) {
+            appLog("User: replay rejected (live devices connected)", "W")
+            setStatus("Replay refused while devices are connected")
+            return
+        }
         appLog("User: replay bin file: $path")
         val info = controller.getBinFileInfo(path)
         if (info == null) {
@@ -1966,6 +2122,7 @@ class MainActivity : Activity() {
         pauseReplayBtn.text = "Pause Replay"
         setupReplayMember(mac, p, info)
         setCurrentDevice(mac)
+        updateConnectButton()
         Log.i(TAG, "replay started: path=$path mac=$mac realtime=$realtime info=$info")
         setStatus("Replaying $path (mac=$mac, realtime=$realtime) ...")
     }
@@ -1976,6 +2133,11 @@ class MainActivity : Activity() {
     private fun startGroupReplay(paths: List<String>, realtime: Boolean) {
         if (replayMac != null || replayMacs.isNotEmpty()) {
             setStatus("Stop the running replay first")
+            return
+        }
+        if (synchronized(deviceStates) { deviceStates.values.any { !it.isReplay } }) {
+            appLog("User: replay rejected (live devices connected)", "W")
+            setStatus("Replay refused while devices are connected")
             return
         }
         appLog("User: replay ${paths.size} bin files: ${paths.joinToString("; ")}")
@@ -2011,6 +2173,7 @@ class MainActivity : Activity() {
         pauseReplayBtn.isEnabled = true
         pauseReplayBtn.text = "Pause Replay"
         setCurrentDevice(replayMacs.first())
+        updateConnectButton()
         Log.i(TAG, "group replay started: members=${replayMacs.size} realtime=$realtime")
         setStatus("Replaying ${replayMacs.size} bin files (realtime=$realtime) ...")
     }
@@ -2037,7 +2200,8 @@ class MainActivity : Activity() {
                 if (!isTransferring) {
                     Log.i(TAG, "replay finished: batches=${st.batches} " +
                             "samples=${st.samples} lostPkgs=${st.lostPackages}")
-                    appLog("App: replay done: Replay finished (${st.batches} batches, ${st.samples} samples)")
+                    appLog("App: replay done: Replay finished (${st.batches} batches, ${st.samples} samples)",
+                        "I", st.profile)
                     setStatus("Replay finished (${st.batches} batches, ${st.samples} samples)")
                     replayMacs.remove(mac)
                     if (replayMac == mac) {
@@ -2061,7 +2225,7 @@ class MainActivity : Activity() {
                 syncSampleRateBuffers(st, updated)
                 if (mac == currentMac) {
                     updateLinkInfo(updated)
-                    syncSampleRateChecked(updated.eegSampleRate)
+                    syncSampleRateCheckedFromInfo(st, updated)
                 }
             }
         }
@@ -2093,6 +2257,7 @@ class MainActivity : Activity() {
             }
             withContext(Dispatchers.Main) {
                 setStatus("stopBinReplay -> $result")
+                updateConnectButton()
             }
         }
     }
@@ -2404,13 +2569,12 @@ class MainActivity : Activity() {
         statusText.text = s
     }
 
-    // Writes one application event line into the SDK log: into the given (or
-    // current) device's profile log when a device is the subject, else into
-    // the controller log.
-    private fun appLog(message: String, level: String = "I", sensor: SensorProfile? = null) {
-        val target = sensor ?: currentState()?.profile
-        if (target != null) {
-            target.log(message, level)
+    // Writes one application event line into the SDK log: into the given
+    // device's profile log when a device is the subject, else into the
+    // controller log.
+    private fun appLog(message: String, level: String = "I", profile: SensorProfile? = null) {
+        if (profile != null) {
+            profile.log(message, level)
         } else if (::controller.isInitialized) {
             controller.log(message, level)
         }
@@ -2431,12 +2595,18 @@ class MainActivity : Activity() {
         fftExecutor.shutdownNow()
         dataWorkerStop.set(true)
         dataWorker?.interrupt()
-        // Fire-and-forget teardown.
-        replayMac?.let { controller.stopBinReplay(it) }
-        for (m in replayMacs) controller.stopBinReplay(m)
+        // Fire-and-forget teardown; keep the replay stop join off the UI thread.
+        val stopMacs = mutableListOf<String>()
+        replayMac?.let { stopMacs.add(it) }
+        stopMacs.addAll(replayMacs)
         replayMacs.clear()
         replayProfile = null
         replayMac = null
+        if (stopMacs.isNotEmpty()) {
+            Thread({
+                for (m in stopMacs) controller.stopBinReplay(m)
+            }, "ReplayStopper").apply { isDaemon = true }.start()
+        }
         val states = synchronized(deviceStates) { deviceStates.values.toList() }
         for (st in states) {
             if (!st.isReplay) st.profile?.disconnect(null)
