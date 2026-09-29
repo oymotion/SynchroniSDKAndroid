@@ -26,7 +26,7 @@ dependencies {
 ```
 
 Supported ABIs: `arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64` (this demo
-enables `arm64-v8a` and `x86`). minSdk 24.
+enables `arm64-v8a` and `x86`). minSdk 26.
 
 ## 1. Permissions
 
@@ -56,10 +56,10 @@ import com.oymotion.sensor.capi.*
 
 val controller = SensorController.getInstance()
 
-// Optional: redirect SDK logs (must be called BEFORE setDebugEnabled(true),
+// Optional: redirect SDK logs (must be called BEFORE DEBUG_ENABLED=True,
 // and both must precede registerBleBridge)
-controller.setLogPath(true, "/sdcard/Documents/sensorsdklog/<session>")
-controller.setDebugEnabled(true)
+controller.setParam("LOG_PATH", "/sdcard/Documents/sensorsdklog/<session>", null)
+controller.setParam("DEBUG_ENABLED", "True", null)
 
 // Register the BLE bridge once, before any scan/connect
 controller.registerBleBridge(applicationContext)
@@ -172,9 +172,10 @@ the previous `setParam` values -> `startDataNotification()`. Explicit user
 calls (`connect()`, `disconnect()`, `stopDataNotification()`) cancel a
 pending resume.
 
-To customize recovery, return `true` from `onAutoReconnect(profile,
-hasLastSession)` and handle it yourself; return `false` to fall back to the
-default flow.
+To customize recovery, call `answer(true)` from `onAutoReconnect(profile,
+hasLastSession, answer)` and handle it yourself (the answer may come from any
+thread, at any later time); `answer(false)` falls back to the default flow.
+If no answer arrives within 10 s the SDK runs the default recovery.
 
 ### 9. Device info
 
@@ -182,7 +183,7 @@ default flow.
 val info = profile.getDeviceInfo()   // valid after READY + successful init
 // deviceName, modelName, hardwareVersion, firmwareVersion, mtuSize,
 // plus a channelCount / sampleRate pair per modality:
-// emg/eeg/ecg/brth/acc/gyro/magAngle/euler/quat/ppg/spo2/impe, the
+// emg/eeg/ecg/brth/acc/gyro/magAngle/euler/quat/ppg/spo2/impe/gest, the
 // aggregated imuChannelCount / imuSampleRate (0 = no aggregated stream),
 // and emg/eeg/ecgMaxSampleRate (0 = not reported).
 ```
@@ -290,8 +291,8 @@ profile.setParam("NTF_IMPEDANCE", "ON")
 profile.setParam("NTF_MAG_ANGLE", "ON")
 profile.setParam("NTF_PPG", "ON")
 profile.setParam("NTF_SPO2", "ON")
-profile.setParam("NTF_IMU", "ON")      // master switch of the four
-                                       // NTF_GFORCE_{ACC,GYRO,EULER,QUAT} streams
+profile.setParam("NTF_IMU", "ON")      // all four ACC/GYRO/EULER/QUAT
+                                       // streams together
 
 // Firmware filter toggles
 profile.setParam("FILTER_50HZ", "ON")  // 50 Hz notch
@@ -302,6 +303,18 @@ profile.setParam("FILTER_LPF", "ON")   // 80 Hz low-pass
 // EEG/ECG sample rate (bound together on devices that have both); validated
 // against getParam("EEG_SAMPLE_RATE_LIST")
 profile.setParam("EEG_SAMPLE_RATE", "500")
+
+// EMG sample rate (new EMG devices only); validated against
+// getParam("EMG_SAMPLE_RATE_LIST")
+profile.setParam("EMG_SAMPLE_RATE", "1000")
+
+// IMU sample rate (devices answering the IMU cap query only); validated
+// against getParam("IMU_SAMPLE_RATE_LIST")
+profile.setParam("IMU_SAMPLE_RATE", "100")
+
+// PPG sample rate (PPG devices only); validated against
+// getParam("PPG_SAMPLE_RATE_LIST")
+profile.setParam("PPG_SAMPLE_RATE", "200")
 
 // NeuCir remote control (NeuCir devices only)
 profile.setParam("NEUCIR_SET_MODE", "APP_REMOTE")
@@ -329,6 +342,12 @@ profile.getParam("FILTER")              // "FILTER_50HZ|ON|FILTER_60HZ|ON|..."
 profile.getParam("NTF")                 // "NTF_BRTH|ON|NTF_ECG|ON|..."
 profile.getParam("EEG_SAMPLE_RATE")     // e.g. "250"
 profile.getParam("EEG_SAMPLE_RATE_LIST")// e.g. "250|500"
+profile.getParam("EMG_SAMPLE_RATE")     // e.g. "500"
+profile.getParam("EMG_SAMPLE_RATE_LIST")// e.g. "500|1000"
+profile.getParam("IMU_SAMPLE_RATE")     // e.g. "50"
+profile.getParam("IMU_SAMPLE_RATE_LIST")// e.g. "50|100|200|250"
+profile.getParam("PPG_SAMPLE_RATE")     // e.g. "50"
+profile.getParam("PPG_SAMPLE_RATE_LIST")// e.g. "50|100|200"
 ```
 
 ### Async API
@@ -360,29 +379,37 @@ controller.pauseBinReplay(mac)     // "OK" or an error string
 controller.resumeBinReplay(mac)
 controller.stopBinReplay(mac)
 
-// Synchronized group replay: every (path, mac) capture starts on one shared
+// Synchronized group replay: every member capture starts on one shared
 // clock anchored at the earliest data record, so concurrently recorded
-// captures keep their original relative offsets. The returned list is
-// input-order aligned with null entries for members that failed validation.
+// captures keep their original relative offsets. Each member is designated
+// by a SensorProfile (e.g. from controller.requireSensor(mac)); the replay
+// rebinds it to the replaying profile. The returned list is input-order
+// aligned with null entries for members that failed validation.
 val group = controller.multiReplayBinFile(listOf(path1, path2),
-                                          listOf(mac1, mac2),
+                                          listOf(profile1, profile2),
                                           realtime = true, timeoutMs = 5000)
 
-// Offline conversion to CSV; returns the CSV file path
-val csvPath = controller.parseBinToCsv(binPath, csvPath)
+// Offline conversion to CSV (listener async; the result string carries the
+// CSV file path on success)
+controller.parseBinToCsv(binPath, csvPath) { result, _ -> ... }
+// or the suspend bridge: val csvPath = controller.parseBinToCsvAsync(binPath, csvPath)
 ```
 
 ## Logging controls
 
 ```kotlin
-controller.setDebugEnabled(true)   // opens the controller log in the log dir
-controller.setLogPath(true, dir)   // redirect; dir is created if missing
-controller.setLogPath(true, null)  // back to the default
-                                   // (/sdcard/Documents/sensorsdklog)
-controller.setLogPath(false, null) // file output off
+controller.setParam("DEBUG_ENABLED", "True", null)  // opens the controller log in the log dir
+controller.setParam("LOG_PATH", dir, null)          // redirect; dir is created if missing
+controller.setParam("LOG_PATH", "True", null)       // back to the default
+                                                    // (/sdcard/Documents/sensorsdklog)
+controller.setParam("LOG_PATH", "False", null)      // file output off
+controller.setParam("DATA_LOG_ENABLED", "True", null) // raw data records on
 ```
 
-Ordering: `setLogPath` before `setDebugEnabled(true)`, and both before
+The controller-level `setParam` / `getParam` take an optional trailing
+`OnParamListener` (`(result, errorMsg)`); `null` = fire-and-forget.
+
+Ordering: `LOG_PATH` before `DEBUG_ENABLED=True`, and both before
 `registerBleBridge`, so the whole session lands in one directory.
 
 Applications can write their own entries into the same timeline:
@@ -393,7 +420,7 @@ profile.log("User toggled filter 50Hz", "I") // profile log when enabled
 ```
 
 `level` accepts `"D"` / `"I"` / `"W"` / `"E"`; `"D"` follows the
-`setDebugEnabled` switch, the others are always emitted. Entries are tagged
+`DEBUG_ENABLED` switch, the others are always emitted. Entries are tagged
 `[App]`.
 
 ## Demo app
@@ -407,7 +434,9 @@ bin replay / parse-to-CSV. A Multi Start/Stop toggle button starts (or
 stops) streaming on all connected devices in sync via
 `multiStartDataNotification` / `multiStopDataNotification`, and a Multi
 Replay Bin button replays several captures at once through
-`multiReplayBinFile` with group-wide pause/resume. Replay end-of-file is
+`multiReplayBinFile` with group-wide pause/resume. The replay path defaults
+to `<session log dir>/test.bin`, and the Replay Bin button opens the system
+file picker and starts the replay on selection. Replay end-of-file is
 reported through `setOnDataTransferStateChangeListener` (isTransferring
 flips to false).
 

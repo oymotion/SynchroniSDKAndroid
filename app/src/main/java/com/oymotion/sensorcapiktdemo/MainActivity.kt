@@ -62,7 +62,7 @@ private const val FFT_UPDATE_INTERVAL_MS = 200L
 private const val REQUEST_PICK_REPLAY_FILE = 42
 
 // The demo's own version, shown in the title.
-private const val DEMO_VERSION = "0.1.24"
+private const val DEMO_VERSION = "0.1.33"
 
 // Sample rate options offered on the Device page (Hz).
 private val SAMPLE_RATE_CANDIDATES = listOf(250, 500, 1000, 2000)
@@ -96,6 +96,7 @@ private val TYPE_DISPLAY_ORDER = listOf(
     DataType.NTF_ECG to "ECG",
     DataType.NTF_BRTH to "BRTH",
     DataType.NTF_GEST to "GEST",
+    DataType.NTF_MAG_ANGLE to "Angle",
 )
 
 // Device-list row highlight: the SELECTED row (Connect/Disconnect target).
@@ -157,7 +158,7 @@ class MainActivity : Activity() {
         // Current EEG page (0-based) and the channel counts the current bio
         // layout was built from.
         var bioPageIndex = 0
-        var lastBioCounts = IntArray(6) // eeg, ecg, brth, ppg, spo2, emg
+        var lastBioCounts = IntArray(7) // eeg, ecg, brth, ppg, spo2, emg, mag
 
         // Per-device data counters.
         var batches = 0L
@@ -166,38 +167,62 @@ class MainActivity : Activity() {
         var lastLogMs = 0L
         val diagTypes = java.util.Collections.synchronizedSet(java.util.HashSet<Int>())
 
-        // Per-type accounting for the stats/rate labels.
+        // Per-type accounting for the stats/rate labels: cumulative valid
+        // samples per stream since its first packet.
         val rateLock = Any()
-        val rateCounts = HashMap<Int, Long>()      // valid samples in the current window
-        val actualRates = HashMap<Int, Double>()   // rotated once per second
+        val rateTotalCounts = HashMap<Int, Long>()   // valid samples since the stream's first packet
+        val actualRates = HashMap<Int, Double>()     // cumulative average, refreshed once per second
         val nominalRates = HashMap<Int, Float>()
         val nominalChannels = HashMap<Int, Int>()
-        val lostCounts = HashMap<Int, Long>()      // latest per-type lostPackageCount
+        val lostCounts = HashMap<Int, Long>()        // latest per-type lostPackageCount
         val typeBatches = HashMap<Int, Long>()
-        var rateWindowStartMs = System.currentTimeMillis()
+        val rateStreamTags = HashMap<Int, Int>()     // last seen batch session tag per type
+        val rateStreamStartMs = HashMap<Int, Long>() // first-packet wall clock per type
+        var rateLastDataMs = 0L                      // last batch wall clock; 2 s silence clears all
 
-        // Rotates the accumulated per-type sample counts into actualRates;
-        // call once per second.
+        // Caller holds rateLock.
+        fun noteRateSamples(type: Int, sessionTag: Int, valid: Long) {
+            val now = System.currentTimeMillis()
+            if (rateStreamTags[type] != sessionTag) {
+                rateStreamTags[type] = sessionTag
+                rateTotalCounts[type] = 0L
+                rateStreamStartMs[type] = now
+            }
+            rateTotalCounts[type] = (rateTotalCounts[type] ?: 0L) + valid
+            rateLastDataMs = now
+        }
+
+        // Recomputes the per-type cumulative averages; call once per second.
         fun updateActualRates() {
             val now = System.currentTimeMillis()
             synchronized(rateLock) {
-                val elapsed = (now - rateWindowStartMs) / 1000.0
-                if (elapsed <= 0.0) return
+                if (rateLastDataMs > 0 && now - rateLastDataMs > 2000) {
+                    actualRates.clear()
+                    rateTotalCounts.clear()
+                    rateStreamStartMs.clear()
+                    rateStreamTags.clear()
+                    rateLastDataMs = 0L
+                    return
+                }
                 actualRates.clear()
-                for ((t, c) in rateCounts) actualRates[t] = c / elapsed
-                rateCounts.clear()
-                rateWindowStartMs = now
+                for ((t, c) in rateTotalCounts) {
+                    val elapsed = (now - (rateStreamStartMs[t] ?: now)) / 1000.0
+                    actualRates[t] = c / elapsed.coerceAtLeast(0.001)
+                }
             }
         }
-        // Stream-start wall clock (s) + first-packet delay (ms) of the
-        // current session, carried by every batch; 0 until known.
-        @Volatile var streamStartTimeSec = 0.0
+        // Stream-start wall clock (s) per data type + first-packet delay (ms)
+        // of the current session, carried by every batch; empty/0 until known.
+        val streamStartTimeSecs = HashMap<Int, Double>()
         @Volatile var streamDelayMs = 0
 
         // Latest impedance per channel (ohms; -1 = unknown), by IMP_* kind.
         val impLock = Any()
         val impedances = arrayOf(
             ArrayList<Float>(), ArrayList<Float>(), ArrayList<Float>(), ArrayList<Float>())
+
+        // Impedance side-text gate (NTF_IMPEDANCE supported + on).
+        @Volatile var impedanceEnabled = false
 
         // Latest gesture readout; -1 = nothing received yet.
         @Volatile var gesture = -1
@@ -329,6 +354,11 @@ class MainActivity : Activity() {
     // Last 1 Hz rotation of the per-type rate windows.
     private var lastRateTickMs = 0L
 
+    // Backend name shown in the SDK header label.
+    private var shownBackend = ""
+    private var backendQueryPending = false
+    private var backendQueryMs = 0L
+
     // Data queue (mac + batch) drained by the data worker.
     private class QueuedBatch(val mac: String, val data: SensorData)
     private val dataQueue = ArrayBlockingQueue<QueuedBatch>(DATA_QUEUE_CAPACITY)
@@ -355,7 +385,25 @@ class MainActivity : Activity() {
                 updateStats()
             }
             maybeSubmitSpectra()
+            pollBackendLabel()
             mainHandler.postDelayed(this, UI_REFRESH_INTERVAL_MS)
+        }
+    }
+
+    // Backend label refresh (1 Hz).
+    private fun pollBackendLabel() {
+        val nowMs = System.currentTimeMillis()
+        if (backendQueryPending || nowMs - backendQueryMs < 1000) return
+        backendQueryPending = true
+        backendQueryMs = nowMs
+        controller.getParam("BACK_END") { result, _ ->
+            mainHandler.post {
+                backendQueryPending = false
+                if (!result.startsWith("Error") && result != shownBackend) {
+                    shownBackend = result
+                    sdkText.text = "SDK: ${controller.version} | Backend: $shownBackend"
+                }
+            }
         }
     }
 
@@ -594,7 +642,7 @@ class MainActivity : Activity() {
         }
         page.addView(autoReconnectCheck)
 
-        // Debug log toggles, both default ON.
+        // Debug log toggles, default ON.
         val debugRow = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         debugLogCheck = CheckBox(this).apply {
             text = "Enable SDK Debug Log"
@@ -611,7 +659,7 @@ class MainActivity : Activity() {
         page.addView(debugRow)
 
         // NTF switches targeting the current device.
-        val ntfKeys = listOf("NTF_EEG", "NTF_EMG", "NTF_GEST", "NTF_PPG", "NTF_SPO2", "NTF_IMU")
+        val ntfKeys = listOf("NTF_EEG", "NTF_IMPEDANCE", "NTF_EMG", "NTF_GEST", "NTF_PPG", "NTF_SPO2", "NTF_IMU", "NTF_MAG_ANGLE")
         val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         var row: LinearLayout? = null
         ntfKeys.forEachIndexed { i, key ->
@@ -620,7 +668,7 @@ class MainActivity : Activity() {
                 grid.addView(row)
             }
             val cb = CheckBox(this).apply {
-                text = key
+                text = if (key == "NTF_IMPEDANCE") "IMPE" else key
                 isEnabled = false
                 setOnCheckedChangeListener { _, isChecked -> onNtfToggled(key, isChecked) }
             }
@@ -980,6 +1028,7 @@ class MainActivity : Activity() {
         v.colorIndex = colorIndex
         v.placeholder = ""
         v.sideText = ""
+        v.setAutoYRange()
         val spectrum = st.bioSpectra[slot]
         if (withSpectrum) {
             spectrum.labels = arrayOf(label)
@@ -999,42 +1048,58 @@ class MainActivity : Activity() {
         v.colorIndex = -1
         v.placeholder = placeholder
         v.sideText = ""
+        v.setAutoYRange()
         st.bioSpectra[slot].visibility = View.GONE
         st.bioSpectra[slot].clear()
     }
 
     // Re-layouts one device's bio slots for one mode.
     private fun layoutBio(st: DeviceUiState, mode: BioMode, eegCh: Int, ecgCh: Int,
-                          brthCh: Int, ppgCh: Int, spo2Ch: Int, emgCh: Int) {
+                          brthCh: Int, ppgCh: Int, spo2Ch: Int, emgCh: Int, magCh: Int) {
         st.bioMode = mode
-        st.lastBioCounts = intArrayOf(eegCh, ecgCh, brthCh, ppgCh, spo2Ch, emgCh)
+        st.lastBioCounts = intArrayOf(eegCh, ecgCh, brthCh, ppgCh, spo2Ch, emgCh, magCh)
         Log.i(TAG, "layoutBio[${st.mac}]: $mode eeg=$eegCh ecg=$ecgCh brth=$brthCh " +
-                "ppg=$ppgCh spo2=$spo2Ch emg=$emgCh page=${st.bioPageIndex}")
+                "ppg=$ppgCh spo2=$spo2Ch emg=$emgCh mag=$magCh page=${st.bioPageIndex}")
         val feeds = ArrayList<BioFeed>()
         val waiting = "Waiting for data ..."
         when (mode) {
             BioMode.EMG -> {
-                st.bioHeader.text = "EMG Waveform"
-                val count = minOf(if (emgCh > 0) emgCh else 0, BIO_SLOT_COUNT)
+                // A mag-angle stream takes the row right after the EMG rows.
+                val hasMag = magCh > 0
+                val count = minOf(if (emgCh > 0) emgCh else 0,
+                    BIO_SLOT_COUNT - (if (hasMag) 1 else 0))
+                st.bioHeader.text = if (hasMag && count > 0) "EMG + Angle Waveform"
+                                    else if (hasMag) "Angle Waveform"
+                                    else "EMG Waveform"
+                val magIndex = count
                 for (i in 0 until BIO_SLOT_COUNT) {
                     if (i < count) {
                         bindSlot(st, i, DataType.NTF_EMG, i, "EMG-${i + 1}", i, IMP_EMG,
                             feeds, withSpectrum = true)
+                    } else if (hasMag && i == magIndex) {
+                        bindSlot(st, i, DataType.NTF_MAG_ANGLE, 0, "Angle", i, -1,
+                            feeds, withSpectrum = true)
+                        st.bioSlots[i].setFixedYRange(0.0, 180.0)
                     } else {
                         unbindSlot(st, i, waiting)
                     }
                 }
             }
             BioMode.EEG -> {
-                st.bioHeader.text = "EEG + ECG + BRTH Waveform"
+                // Angle row directly above the ECG row.
                 val hasECG = ecgCh > 0
                 val hasBRTH = brthCh > 0
-                val perPage = BIO_SLOT_COUNT - (if (hasECG) 1 else 0) - (if (hasBRTH) 1 else 0)
+                val hasMag = magCh > 0
+                st.bioHeader.text = if (hasMag) "EEG + ECG + BRTH + Angle Waveform"
+                                    else "EEG + ECG + BRTH Waveform"
+                val perPage = BIO_SLOT_COUNT - (if (hasECG) 1 else 0) - (if (hasBRTH) 1 else 0) -
+                    (if (hasMag) 1 else 0)
                 val pages = bioPageCount(perPage, eegCh)
                 st.bioPageIndex = st.bioPageIndex.coerceIn(0, pages - 1)
                 val startCh = st.bioPageIndex * perPage
                 val ecgIndex = BIO_SLOT_COUNT - 1 - (if (hasBRTH) 1 else 0)
                 val brthIndex = BIO_SLOT_COUNT - 1
+                val magIndex = ecgIndex - (if (hasECG) 1 else 0)
                 for (i in 0 until BIO_SLOT_COUNT) {
                     val ch = startCh + i
                     if (i < perPage && ch < eegCh) {
@@ -1045,6 +1110,10 @@ class MainActivity : Activity() {
                             withSpectrum = true)
                     } else if (hasBRTH && i == brthIndex) {
                         bindSlot(st, i, DataType.NTF_BRTH, 0, "BRTH", -1, IMP_BRTH, feeds)
+                    } else if (hasMag && i == magIndex) {
+                        bindSlot(st, i, DataType.NTF_MAG_ANGLE, 0, "Angle", i, -1,
+                            feeds, withSpectrum = true)
+                        st.bioSlots[i].setFixedYRange(0.0, 180.0)
                     } else {
                         // Slots past the last EEG channel stay blank.
                         val noSuchChannel = i < perPage && ch >= eegCh
@@ -1104,7 +1173,8 @@ class MainActivity : Activity() {
     private fun bioPageCount(st: DeviceUiState?): Int {
         if (st == null || st.bioMode != BioMode.EEG) return 1
         val c = st.lastBioCounts
-        val perPage = BIO_SLOT_COUNT - (if (c[1] > 0) 1 else 0) - (if (c[2] > 0) 1 else 0)
+        val perPage = BIO_SLOT_COUNT - (if (c[1] > 0) 1 else 0) - (if (c[2] > 0) 1 else 0) -
+            (if (c[6] > 0) 1 else 0)
         return bioPageCount(perPage, c[0])
     }
 
@@ -1128,14 +1198,14 @@ class MainActivity : Activity() {
         st.bioPageIndex = newPage
         appLog("User: ${if (delta < 0) "prev" else "next"} page -> $newPage", "D", st.profile)
         val c = st.lastBioCounts
-        layoutBio(st, BioMode.EEG, c[0], c[1], c[2], c[3], c[4], c[5])
+        layoutBio(st, BioMode.EEG, c[0], c[1], c[2], c[3], c[4], c[5], c[6])
     }
 
-    // Mode from DeviceInfo (PPG > EEG > EMG).
+    // Mode from DeviceInfo (PPG > EEG > EMG; a mag-only device uses EMG).
     private fun detectBioMode(info: DeviceInfo): BioMode = when {
         info.ppgSampleRate > 0 || info.ppgChannelCount > 0 -> BioMode.PPG
         info.eegChannelCount > 0 -> BioMode.EEG
-        info.emgChannelCount > 0 -> BioMode.EMG
+        info.emgChannelCount > 0 || info.magAngleChannelCount > 0 -> BioMode.EMG
         else -> BioMode.NONE
     }
 
@@ -1144,20 +1214,24 @@ class MainActivity : Activity() {
     private fun maybeReconfigureBio(st: DeviceUiState, d: SensorData) {
         val t = d.dataType
         if (t != DataType.NTF_EMG && t != DataType.NTF_EEG && t != DataType.NTF_ECG &&
-            t != DataType.NTF_BRTH && t != DataType.NTF_PPG && t != DataType.NTF_SPO2) return
+            t != DataType.NTF_BRTH && t != DataType.NTF_PPG && t != DataType.NTF_SPO2 &&
+            t != DataType.NTF_MAG_ANGLE) return
         synchronized(st.bioChannels) {
             val prev = st.bioChannels.put(t, d.channelCount)
             val desired = when {
                 st.bioChannels.containsKey(DataType.NTF_PPG) ||
                     st.bioChannels.containsKey(DataType.NTF_SPO2) -> BioMode.PPG
                 st.bioChannels.containsKey(DataType.NTF_EEG) -> BioMode.EEG
-                st.bioChannels.containsKey(DataType.NTF_EMG) -> BioMode.EMG
+                st.bioChannels.containsKey(DataType.NTF_EMG) ||
+                    st.bioChannels.containsKey(DataType.NTF_MAG_ANGLE) -> BioMode.EMG
                 else -> BioMode.NONE
             }
             val needsRebuild = desired != st.bioMode ||
                 (prev != null && prev != d.channelCount) ||
                 (desired == BioMode.EEG && (t == DataType.NTF_ECG || t == DataType.NTF_BRTH) &&
-                    st.bioFeeds.none { it.dataType == t })
+                    st.bioFeeds.none { it.dataType == t }) ||
+                ((desired == BioMode.EEG || desired == BioMode.EMG) &&
+                    t == DataType.NTF_MAG_ANGLE && st.bioFeeds.none { it.dataType == t })
             if (!needsRebuild) return
         }
         val rebuild = Runnable {
@@ -1172,7 +1246,8 @@ class MainActivity : Activity() {
                     st.bioChannels[DataType.NTF_BRTH] ?: 0,
                     st.bioChannels[DataType.NTF_PPG] ?: 0,
                     st.bioChannels[DataType.NTF_SPO2] ?: 0,
-                    st.bioChannels[DataType.NTF_EMG] ?: 0)
+                    st.bioChannels[DataType.NTF_EMG] ?: 0,
+                    st.bioChannels[DataType.NTF_MAG_ANGLE] ?: 0)
             }
         }
         if (Looper.myLooper() == Looper.getMainLooper()) rebuild.run() else mainHandler.post(rebuild)
@@ -1477,12 +1552,13 @@ class MainActivity : Activity() {
                     if (info.ppgChannelCount > 0) st.bioChannels[DataType.NTF_PPG] = info.ppgChannelCount
                     if (info.spo2ChannelCount > 0) st.bioChannels[DataType.NTF_SPO2] = info.spo2ChannelCount
                     if (info.emgChannelCount > 0) st.bioChannels[DataType.NTF_EMG] = info.emgChannelCount
+                    if (info.magAngleChannelCount > 0) st.bioChannels[DataType.NTF_MAG_ANGLE] = info.magAngleChannelCount
                 }
                 val mode = detectBioMode(info)
                 if (mode != BioMode.NONE) {
                     layoutBio(st, mode, info.eegChannelCount, info.ecgChannelCount,
                         info.brthChannelCount, info.ppgChannelCount, info.spo2ChannelCount,
-                        info.emgChannelCount)
+                        info.emgChannelCount, info.magAngleChannelCount)
                 } else {
                     resetBio(st)
                 }
@@ -1683,16 +1759,8 @@ class MainActivity : Activity() {
         doMultiStart(sensors)
     }
 
-    // Same model name on all devices -> default sync params; mixed/unknown
-    // models -> relaxed params.
     private fun doMultiStart(sensors: List<SensorProfile>) {
-        val names = sensors.map { it.getDeviceInfo()?.modelName }.toSet()
-        val sameModel = names.size == 1 && null !in names
-        val timeoutMs = if (sameModel) 30000 else 60000
-        val maxDelayDispersionMs = if (sameModel) 5 else -1
-        val maxAttempts = if (sameModel) 3 else 5
-        controller.multiStartDataNotification(sensors, timeoutMs, maxDelayDispersionMs,
-                maxAttempts) { results, errors ->
+        controller.multiStartDataNotification(sensors, 0, -1, 1) { results, errors ->
             mainHandler.post {
                 reportMultiResult("start", "started", results, errors)
                 multiOpActive = false
@@ -1809,6 +1877,8 @@ class MainActivity : Activity() {
                 "NTF_PPG" to info.ppgChannelCount,
                 "NTF_SPO2" to info.spo2ChannelCount,
                 "NTF_IMU" to maxOf(info.accChannelCount, info.gyroChannelCount),
+                "NTF_MAG_ANGLE" to info.magAngleChannelCount,
+                "NTF_IMPEDANCE" to info.impeChannelCount,
             )
             val ntfValues = parseAggregate(ntfResult)
             val filterValues = parseAggregate(filterResult)
@@ -1826,6 +1896,10 @@ class MainActivity : Activity() {
                 cb.isChecked = hasFilter && filterValues[key] == "ON"
             }
             suppressNtfCallbacks = false
+            deviceStates.values.firstOrNull { it.profile === p }?.let { st ->
+                st.impedanceEnabled =
+                    (channelMap["NTF_IMPEDANCE"] ?: 0) > 0 && ntfValues["NTF_IMPEDANCE"] == "ON"
+            }
             Log.i(TAG, "ntf readback: \"$ntfResult\" -> " + ntfChecks.map { (k, cb) ->
                 "$k=${if (cb.isEnabled) "en" else "dis"}/${if (cb.isChecked) "on" else "off"}" +
                         "${if (cb.visibility != View.VISIBLE) "/gone" else ""}"
@@ -1842,8 +1916,8 @@ class MainActivity : Activity() {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val version = controller.version.replace('.', '_')
         sessionLogDir = "/sdcard/Documents/sensorsdklog/${stamp}_$version"
-        controller.setParam("LOG_PATH", sessionLogDir!!)
-        controller.setParam("DEBUG_ENABLED", "True")
+        controller.setParam("LOG_PATH", sessionLogDir!!, null)
+        controller.setParam("DEBUG_ENABLED", "True", null)
         Log.i(TAG, "LOG_PATH -> $sessionLogDir")
     }
 
@@ -1944,7 +2018,7 @@ class MainActivity : Activity() {
         if (checked) {
             applySdkDebugLog()
         } else {
-            controller.setParam("DEBUG_ENABLED", "False")
+            controller.setParam("DEBUG_ENABLED", "False", null)
         }
         val value = if (checked) "True" else "False"
         for (p in readyProfiles()) {
@@ -2046,11 +2120,12 @@ class MainActivity : Activity() {
 
     // Link/MTU display from DeviceInfo; "--" for values the link did not report.
     private fun updateLinkInfo(info: DeviceInfo) {
+        val backendPart = if (info.backend.isEmpty()) "" else " | backend ${info.backend}"
         linkText.text =
-            if (info.peripheralLatency < 0 || info.connectionIntervalMs <= 0) "Link: --"
+            if (info.peripheralLatency < 0 || info.connectionIntervalMs <= 0) "Link: --$backendPart"
             else "Link: ${info.connectionIntervalMs}ms / " +
                     "latency ${info.peripheralLatency} / " +
-                    "timeout ${info.supervisionTimeoutMs}ms"
+                    "timeout ${info.supervisionTimeoutMs}ms" + backendPart
         mtuText.text = if (info.mtuSize <= 0) "MTU: --" else "MTU: ${info.mtuSize}"
     }
 
@@ -2143,6 +2218,7 @@ class MainActivity : Activity() {
         appLog("User: replay ${paths.size} bin files: ${paths.joinToString("; ")}")
         val infos = ArrayList<BinFileInfo?>()
         val macs = ArrayList<String>()
+        val sensors = ArrayList<SensorProfile?>()
         for (path in paths) {
             if (!File(path).exists()) {
                 setStatus("Replay failed: file not found: $path")
@@ -2154,8 +2230,9 @@ class MainActivity : Activity() {
             }
             infos.add(info)
             macs.add(info?.mac?.takeIf { it.isNotEmpty() } ?: "REPLAY")
+            sensors.add(controller.requireSensor(macs.last()))
         }
-        val profiles = controller.multiReplayBinFile(paths, macs, realtime, 5000)
+        val profiles = controller.multiReplayBinFile(paths, sensors, realtime, 5000)
         for (i in paths.indices) {
             val p = profiles[i]
             if (p == null) {
@@ -2339,12 +2416,17 @@ class MainActivity : Activity() {
             // Bio page: auto mode routing (EMG/EEG/PPG).
             maybeReconfigureBio(st, d)
             // Bio slots bound to this stream; bio types pass through the
-            // device's Live Filter before entering the ring.
+            // device's Live Filter before entering the ring (the Angle row
+            // stays unfiltered).
             val feeds = st.bioFeeds
             for (f in feeds) {
                 if (f.dataType != d.dataType || f.channel >= d.channelCount) continue
-                f.view.appendBatch(d, f.channel, 1) { ch, vals ->
-                    st.liveFilter.apply(d.dataType, ch, vals, d.sampleRate)
+                if (d.dataType == DataType.NTF_MAG_ANGLE) {
+                    f.view.appendBatch(d, f.channel, 1)
+                } else {
+                    f.view.appendBatch(d, f.channel, 1) { ch, vals ->
+                        st.liveFilter.apply(d.dataType, ch, vals, d.sampleRate)
+                    }
                 }
             }
             updateImpedances(st, d, fresh)
@@ -2380,7 +2462,7 @@ class MainActivity : Activity() {
                         }
                     }
                 }
-                else -> {} // impedance/ADS/MAG streams: counters only
+                else -> {} // impedance/ADS streams: counters only
             }
         }
         // Throttled per-batch logcat heartbeat.
@@ -2404,12 +2486,12 @@ class MainActivity : Activity() {
                     if (fresh && d.isChannelEnabled(0) && !d.isLost(0, i)) valid++
                 }
                 if (valid > 0) {
-                    st.rateCounts[d.dataType] = (st.rateCounts[d.dataType] ?: 0L) + valid
+                    st.noteRateSamples(d.dataType, d.startTimeStamp, valid)
                 }
             }
             if (d.sampleRate > 0) st.nominalRates[d.dataType] = d.sampleRate
             if (d.channelCount > 0) st.nominalChannels[d.dataType] = d.channelCount
-            if (d.startTimeSec > 0) st.streamStartTimeSec = d.startTimeSec
+            if (d.startTimeSec > 0) st.streamStartTimeSecs[d.dataType] = d.startTimeSec
             if (d.delay > 0) st.streamDelayMs = d.delay
         }
     }
@@ -2431,10 +2513,11 @@ class MainActivity : Activity() {
                     if (fresh && d.isChannelEnabled(0) && !d.isLost(seg[1], i)) valid++
                 }
                 if (valid > 0) {
-                    st.rateCounts[seg[0]] = (st.rateCounts[seg[0]] ?: 0L) + valid
+                    st.noteRateSamples(seg[0], d.startTimeStamp, valid)
                 }
                 if (d.sampleRate > 0) st.nominalRates[seg[0]] = d.sampleRate
                 st.nominalChannels[seg[0]] = seg[2]
+                if (d.startTimeSec > 0) st.streamStartTimeSecs[seg[0]] = d.startTimeSec
             }
         }
     }
@@ -2464,10 +2547,17 @@ class MainActivity : Activity() {
     private fun refreshBioSideTexts(st: DeviceUiState) {
         for (f in st.bioFeeds) {
             if (f.impKind < 0) continue
+            if (!st.impedanceEnabled) {
+                f.view.sideText = ""
+                continue
+            }
             val v = synchronized(st.impLock) {
                 st.impedances[f.impKind].getOrNull(f.impChannel) ?: -1f
             }
-            if (v < 0f) continue
+            if (v < 0f) {
+                f.view.sideText = ""
+                continue
+            }
             val kOhm = v / 1000f
             f.view.sideColor = when {
                 kOhm <= 500f -> Color.rgb(60, 200, 60)
@@ -2518,7 +2608,8 @@ class MainActivity : Activity() {
         }
     }
 
-    // Measured-vs-nominal rate line.
+    // Measured-vs-nominal rate line; each type carries its own stream-start
+    // wall clock.
     private fun buildRateText(st: DeviceUiState): String {
         val entries = ArrayList<String>()
         synchronized(st.rateLock) {
@@ -2526,13 +2617,15 @@ class MainActivity : Activity() {
                 val actual = st.actualRates[type] ?: continue
                 val nominal = st.nominalRates[type] ?: 0f
                 val nominalText = if (nominal > 0f) "$nominal" else "--"
-                entries.add("$name ${String.format(Locale.US, "%.1f", actual)} / ${nominalText}Hz")
+                var entry = "$name ${String.format(Locale.US, "%.1f", actual)} / ${nominalText}Hz"
+                val startSec = st.streamStartTimeSecs[type] ?: 0.0
+                if (startSec > 0) {
+                    val startMs = (startSec * 1000.0).toLong()
+                    val fmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+                    entry += " (start ${fmt.format(Date(startMs))})"
+                }
+                entries.add(entry)
             }
-        }
-        if (st.streamStartTimeSec > 0) {
-            val startMs = (st.streamStartTimeSec * 1000.0).toLong()
-            val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
-            entries.add("start ${fmt.format(Date(startMs))}")
         }
         if (st.streamDelayMs > 0) {
             entries.add("delay ${st.streamDelayMs}ms")
@@ -2561,7 +2654,7 @@ class MainActivity : Activity() {
         st.rawGesture = -1
         st.possibility = -1
         st.strength = -1
-        st.streamStartTimeSec = 0.0
+        st.streamStartTimeSecs.clear()
         st.streamDelayMs = 0
     }
 
