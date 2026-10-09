@@ -25,7 +25,7 @@ dependencies {
 }
 ```
 
-Supported ABIs: `arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64` (this demo
+Supported ABIs: `arm64-v8a`, `x86`, `x86_64` (this demo
 enables `arm64-v8a` and `x86`). minSdk 26.
 
 ## 1. Permissions
@@ -168,9 +168,9 @@ profile.setAutoReconnect(true)    // default on; set false to opt out
 
 While enabled and the device is streaming, an abnormal disconnect is followed
 by automatic reconnect -> `init()` with the previous arguments -> re-applying
-the previous `setParam` values -> `startDataNotification()`. Explicit user
-calls (`connect()`, `disconnect()`, `stopDataNotification()`) cancel a
-pending resume.
+the previous `setParam` values -> `startDataNotification()`. A pending resume
+is cancelled by `connect()`, `disconnect()`, `setAutoReconnect(false)`, or a
+successful `startDataNotification()`.
 
 To customize recovery, call `answer(true)` from `onAutoReconnect(profile,
 hasLastSession, answer)` and handle it yourself (the answer may come from any
@@ -267,9 +267,13 @@ profile.setOnDataListener { _, dataList ->
 ### 12. Battery level
 
 ```kotlin
-val power = profile.getBatteryLevel()   // suspend extension; 0-100,
-                                        // -1 = no valid reading yet
+val power = profile.getBatteryLevel()   // suspend extension; fresh reading
+                                        // 0-100, throws IOException on failure
 ```
+
+`getCachedPower()` returns the last reading pushed via `onPowerChanged` or
+delivered by a successful `getBatteryLevel()`, without touching the device;
+`-1` means no valid reading yet.
 
 ### 13. setParam / getParam
 
@@ -277,7 +281,9 @@ val power = profile.getBatteryLevel()   // suspend extension; 0-100,
 the profile after `READY`. Changing an `NTF_*` key while streaming restarts
 the data notification so the setting takes effect; `FILTER_*` keys are
 applied on the fly without interrupting the stream.
-Returns `"OK"` on success or a string starting with `"Error"`.
+Returns `"OK"` on success or an error string: argument/state rejections start
+with `"Error: "`, while command-outcome failures reported by the device are
+all-caps `"ERROR: ..."` strings (e.g. `"ERROR: restart stream fail"`).
 
 ```kotlin
 // Data stream toggles, "ON" / "OFF"
@@ -369,11 +375,12 @@ pipeline; parsed results arrive via `onData`, same as live data.
 val info = controller.getBinFileInfo(path)   // BinFileInfo: mac, deviceName,
                                              // durationSec, deviceInfo, valid
 
-// Replay (refused while the target profile is streaming live data)
-val replay = controller.replayBinFile(path, deviceMac = "", realtime = true,
-                                      timeoutMs = 5000)
-// deviceMac "" lets the SDK create the profile from the bin config record;
-// or pass the mac of an existing profile with listeners registered.
+// Replay (refused while the device's live profile is linked: Connected/Ready)
+val replay = controller.replayBinFile(path, info.mac, true, 5000)
+// deviceMac is required ("" is rejected); take it from
+// getBinFileInfo(path).mac or pass the mac of an existing profile with
+// listeners registered. A shorter overload replayBinFile(path, deviceMac,
+// realtime) uses the SDK default delegate-wait timeout.
 
 controller.pauseBinReplay(mac)     // "OK" or an error string
 controller.resumeBinReplay(mac)
@@ -387,7 +394,7 @@ controller.stopBinReplay(mac)
 // aligned with null entries for members that failed validation.
 val group = controller.multiReplayBinFile(listOf(path1, path2),
                                           listOf(profile1, profile2),
-                                          realtime = true, timeoutMs = 5000)
+                                          true, 5000)
 
 // Offline conversion to CSV (listener async; the result string carries the
 // CSV file path on success)
