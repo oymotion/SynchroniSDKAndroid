@@ -62,7 +62,7 @@ private const val FFT_UPDATE_INTERVAL_MS = 200L
 private const val REQUEST_PICK_REPLAY_FILE = 42
 
 // The demo's own version, shown in the title.
-private const val DEMO_VERSION = "0.1.33"
+private const val DEMO_VERSION = "0.1.36"
 
 // Sample rate options offered on the Device page (Hz).
 private val SAMPLE_RATE_CANDIDATES = listOf(250, 500, 1000, 2000)
@@ -311,6 +311,7 @@ class MainActivity : Activity() {
     private lateinit var autoReconnectCheck: CheckBox
     private lateinit var debugLogCheck: CheckBox
     private lateinit var binDataCheck: CheckBox
+    private lateinit var translateImuCheck: CheckBox
     private lateinit var replayPathEdit: EditText
     private var sessionLogDir: String? = null
     private lateinit var replayBtn: Button
@@ -642,7 +643,7 @@ class MainActivity : Activity() {
         }
         page.addView(autoReconnectCheck)
 
-        // Debug log toggles, default ON.
+        // Debug toggles.
         val debugRow = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         debugLogCheck = CheckBox(this).apply {
             text = "Enable SDK Debug Log"
@@ -654,8 +655,15 @@ class MainActivity : Activity() {
             isChecked = true
             setOnCheckedChangeListener { _, isChecked -> onBinDataToggled(isChecked) }
         }
+        // Translate IMU switch, default ON.
+        translateImuCheck = CheckBox(this).apply {
+            text = "Translate IMU (split ACC/GYRO/EULER/QUAT)"
+            isChecked = true
+            setOnCheckedChangeListener { _, isChecked -> onTranslateImuToggled(isChecked) }
+        }
         debugRow.addView(debugLogCheck)
         debugRow.addView(binDataCheck)
+        debugRow.addView(translateImuCheck)
         page.addView(debugRow)
 
         // NTF switches targeting the current device.
@@ -1499,7 +1507,7 @@ class MainActivity : Activity() {
                     return@launch
                 }
                 // New connections inherit the current Auto Reconnect toggle.
-                prof.setAutoReconnect(autoReconnect)
+                prof.autoReconnect = autoReconnect
                 val kept = synchronized(deviceStates) { deviceStates[mac] }
                 val st = if (kept != null && !kept.isReplay && kept.profile === prof) {
                     kept
@@ -2041,12 +2049,22 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun onTranslateImuToggled(checked: Boolean) {
+        val value = if (checked) "True" else "False"
+        appLog("User: translate IMU ${if (checked) "ON" else "OFF"}")
+        controller.setParam("TRANSLATE_IMU", value) { result, _ ->
+            mainHandler.post {
+                appLog("App: setParam(TRANSLATE_IMU, $value) -> $result")
+            }
+        }
+    }
+
     private fun onAutoReconnectToggled(checked: Boolean) {
         autoReconnect = checked
         appLog("User: auto reconnect ${if (checked) "ON" else "OFF"}")
         val states = synchronized(deviceStates) { deviceStates.values.toList() }
         for (st in states) {
-            if (!st.isReplay) st.profile?.setAutoReconnect(checked)
+            if (!st.isReplay) st.profile?.autoReconnect = checked
         }
     }
 
