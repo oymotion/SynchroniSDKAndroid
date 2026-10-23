@@ -13,29 +13,33 @@
 | 采样率 | EEG `1000\|500\|250`（默认 `1000`）；IMU `50\|100\|200`；PPG `50\|100\|200\|400` |
 | SDK 版本 | 0.9.6 |
 
-## 能力假设（连接后用 getDeviceInfo() 确认）
+## 已固化能力（单一事实来源：`device_specs/cerelax_pro.py`，851C 实测）
 
-> 下列能力均需通过 `getDeviceInfo()` 运行时确认，不做硬编码假设。`>0` 才执行对应用例，否则记录"设备不支持，跳过"。
+> 本表是 Cerelax-Pro 的「期望基线」，测试据此**硬断言**：设备行为偏离 spec 即 FAIL（而非跳过）。
+> 判定口径以 `getDeviceInfo()` 的 `ChannelCount` 为准（`>0` 支持，`==0` 不支持）；**不以** `getParam('NTF_XXX')` 返回 `'ON'` 判定（其对不支持流也常返回 `'ON'`）。
 
-| 能力 | 判定字段（DeviceInfo） | 假设 | 状态 |
-|------|------------------------|------|------|
-| 脑电 EEG | `EegChannelCount > 0` | 支持（2 通道，核心） | 待确认 |
-| PPG | `PpgChannelCount > 0` | 支持（核心） | 待确认 |
-| 聚合 IMU（NTF_IMU） | `ImuChannelCount > 0` | 待确认（聚合流或四路独立 `NTF_GFORCE_*`） | 待确认 |
-| 加速度 ACC | `AccChannelCount > 0` | 可能支持（IMU 组成） | 待确认 |
-| 陀螺仪 GYRO | `GyroChannelCount > 0` | 可能支持（IMU 组成） | 待确认 |
-| 欧拉角 Euler | `EulerChannelCount > 0` | 可能支持 | 待确认 |
-| 四元数 Quat | `QuatChannelCount > 0` | 可能支持 | 待确认 |
-| 阻抗 IMPEDANCE | `ImpeChannelCount > 0` | 支持（2 通道电极接触检测） | 待确认 |
-| SpO2 | `Spo2ChannelCount > 0` | 待确认（PPG 相关） | 待确认 |
-| 心电 ECG | `EcgChannelCount > 0` | 不支持（头环无 ECG） | 待确认 |
-| 肌电 EMG | `EmgChannelCount > 0` | 不支持（脑电头环） | 待确认 |
-| 手势 GEST | 起流后看 NTF_GEST | 不支持（脑电头环） | 待确认 |
-| 呼吸 BRTH | `BrthChannelCount > 0` | 不支持 | 待确认 |
-| 磁角度 MAG_ANGLE | `MagAngleChannelCount > 0` | 待确认 | 待确认 |
+| 能力 | 判定字段 | spec 期望（channels） |
+|------|----------|----------------------|
+| 脑电 EEG | `EegChannelCount` | 2（核心） |
+| PPG | `PpgChannelCount` | 2 |
+| SpO2 | `Spo2ChannelCount` | 2 |
+| 聚合 IMU | `ImuChannelCount` | 6（= acc3 + gyro3，6 轴聚合，无磁力计） |
+| 加速度 ACC | `AccChannelCount` | 3 |
+| 陀螺仪 GYRO | `GyroChannelCount` | 3 |
+| 阻抗 IMPEDANCE | `ImpeChannelCount` | 2（电极接触检测） |
+| 欧拉角 Euler | `EulerChannelCount` | 0（不支持，6 轴无欧拉角） |
+| 四元数 Quat | `QuatChannelCount` | 0（不支持，6 轴无四元数） |
+| 磁角度 MAG_ANGLE | `MagAngleChannelCount` | 0（不支持，无磁力计） |
+| 心电 ECG | `EcgChannelCount` | 0（不支持） |
+| 肌电 EMG | `EmgChannelCount` | 0（不支持） |
+| 手势 GEST | — | 不支持（头环无手势传感器） |
+| 呼吸 BRTH | `BrthChannelCount` | 0（不支持） |
 
-> 与 OB6000C 的关键差异：Cerelax 为 **2 通道 EEG 头环**（OB6000C 为 32 通道），并**新增 PPG / IMU / Impedance 电极接触检测**；不支持 ECG / EMG / GEST / BRTH。
-> 采样率有三套（EEG / IMU / PPG）。当前 SDK 版本的 `setParam` 仅提供 `EEG_SAMPLE_RATE` 设置接口；IMU / PPG 采样率设置（`IMU_SAMPLE_RATE` / `PPG_SAMPLE_RATE`）**为规划中的功能，当前版本尚未提供**，仅可读 `getDeviceInfo()` 的只读字段（`ImuSampleRate` / `PpgSampleRate`）。相关设置用例已先行登记（PARAM-FUNC-012/013、DATA-FUNC-014），待 SDK 实现后执行。
+> 采样率三套（EEG / IMU / PPG）**均支持 `getParam`/`setParam`**：
+>   - `EEG_SAMPLE_RATE`：`250|500|1000`，默认 `1000`
+>   - `IMU_SAMPLE_RATE`：`50|100|200`，默认 `200`
+>   - `PPG_SAMPLE_RATE`：`50|100|200|400`，默认 `50`
+> 滤波开关四项均支持：`FILTER_50HZ` / `FILTER_60HZ` / `FILTER_HPF` / `FILTER_LPF`。
 
 ## 环境与前置条件
 
@@ -123,7 +127,7 @@
 | SensorProfile | connect/disconnect | DEV-SM-001/004 | DEV-SM-002、DEV-SM-015/016 |
 | SensorProfile | init | DATA-FUNC-001 | DATA-FUNC-002、DATA-BND-001/002、DATA-ROB-001 |
 | SensorProfile | start/stopDataNotification | DATA-FUNC-003/004 | DATA-FUNC-002、DATA-ROB-002 |
-| SensorProfile | setParam/getParam | PARAM-FUNC-001/002/004/006 | PARAM-FUNC-005/008、PARAM-BND-001/002 |
+| SensorProfile | setParam/getParam | PARAM-FUNC-001/002/004/006/012/013 | PARAM-FUNC-005/008、PARAM-BND-001/002/003 |
 | SensorProfile | getBatteryLevel/onPowerChanged | BATT-FUNC-001/002 | BATT-FUNC-004（失效模式） |
 | SensorProfile | async 变体 | ASYNC-FUNC-001~012 | ASYNC-FUNC-010（混用限制） |
 | SensorData | getSampleRate/getChannelCount 等 | DATA-FUNC-006 | DATA-PERF-003（标称值校验） |
