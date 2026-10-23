@@ -47,6 +47,23 @@ class WaveformView @JvmOverloads constructor(
     // Centered text shown while the ring is empty.
     @Volatile var placeholder: String = ""
 
+    // Fixed Y range; off = auto from the visible samples.
+    @Volatile private var fixedYRange = false
+    private var fixedYLow = 0.0
+    private var fixedYHigh = 0.0
+
+    fun setFixedYRange(low: Double, high: Double) {
+        fixedYLow = low
+        fixedYHigh = high
+        fixedYRange = true
+        postInvalidate()
+    }
+
+    fun setAutoYRange() {
+        fixedYRange = false
+        postInvalidate()
+    }
+
     // Current channel count.
     val channels: Int
         get() = viewChannels
@@ -235,10 +252,19 @@ class WaveformView @JvmOverloads constructor(
             }
             val path = paths[ch % paths.size]
             path.rewind()
-            val scale = (rowH / 2f - 4f) / maxAbs
+            val center: Float
+            val scale: Float
+            if (fixedYRange) {
+                center = ((fixedYLow + fixedYHigh) / 2.0).toFloat()
+                val half = ((fixedYHigh - fixedYLow) / 2.0).toFloat()
+                scale = (rowH / 2f - 4f) / max(1e-6f, half)
+            } else {
+                center = 0f
+                scale = (rowH / 2f - 4f) / maxAbs
+            }
             for (k in 0 until count) {
                 val x = k * plotW / max(1, cap - 1)
-                val y = mid - snapshot[k] * scale
+                val y = mid - (snapshot[k] - center) * scale
                 if (k == 0) path.moveTo(x, y) else path.lineTo(x, y)
             }
             val colorIdx = if (colorIndex >= 0) colorIndex else ch
