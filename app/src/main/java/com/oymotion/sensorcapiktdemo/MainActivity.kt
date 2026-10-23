@@ -45,6 +45,9 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
+import kotlin.math.roundToInt
 
 // Logcat tag.
 private const val TAG = "SensorCapiKtDemo"
@@ -62,7 +65,12 @@ private const val FFT_UPDATE_INTERVAL_MS = 200L
 private const val REQUEST_PICK_REPLAY_FILE = 42
 
 // The demo's own version, shown in the title.
-private const val DEMO_VERSION = "0.1.36"
+private const val DEMO_VERSION = "0.1.40"
+
+// Relax row: 50 Hz time grid over a 5 s window; the row's feed sentinel.
+private const val RELAX_GRID_RATE = 50f
+private const val RELAX_RING_SAMPLES = 250
+private const val RELAX_FEED_TYPE = -1
 
 // Sample rate options offered on the Device page (Hz).
 private val SAMPLE_RATE_CANDIDATES = listOf(250, 500, 1000, 2000)
@@ -239,6 +247,66 @@ class MainActivity : Activity() {
         // Bumped on every clearDataViews.
         @Volatile var dataSession = 0
 
+        // Algo (RELAX row) state.
+        var algo: SensorAlgo? = null
+        val algoLock = Any()
+        var lastRelaxStep = 0uL
+        var lastRelaxTimestamp = -1.0
+        var lastRelaxValue = 0f
+        var algoResetGeneration = 0L
+        @Volatile var relaxQueryPending = false
+        var relaxView: WaveformView? = null
+        var algoCsvWriter: java.io.BufferedWriter? = null
+        var algoCsvPath: String? = null
+        val algoFeedTypes = java.util.Collections.synchronizedSet(java.util.HashSet<Int>())
+
+        // Recreates the algo controller with the given storage mode (Clone
+        // Data toggle): a full state reset.
+        fun recreateAlgo(cloneMode: Boolean) {
+            algoResetGeneration++
+            lastRelaxStep = 0uL
+            lastRelaxTimestamp = -1.0
+            lastRelaxValue = 0f
+            relaxView?.clear()
+            val created = try {
+                SensorAlgo()
+            } catch (e: Exception) {
+                appLog("App: algo create failed: ${e.message}", "W", profile)
+                null
+            }
+            val old: SensorAlgo?
+            synchronized(algoLock) {
+                old = algo
+                algo = created
+            }
+            if (created != null) {
+                scope.launch {
+                    runCatching {
+                        created.init()
+                        created.setParam("CLONE", if (cloneMode) "True" else "False")
+                        created.setParam("EEG_REFRESH_RATE", "1")
+                    }.onFailure {
+                        appLog("App: algo init failed: ${it.message}", "W", profile)
+                    }
+                }
+            }
+            if (old != null) {
+                Thread({ old.destroy() }, "AlgoDestroy").apply { isDaemon = true }.start()
+            }
+        }
+
+        // Releases the algo controller.
+        fun destroyAlgo() {
+            val old: SensorAlgo?
+            synchronized(algoLock) {
+                old = algo
+                algo = null
+            }
+            if (old != null) {
+                Thread({ old.destroy() }, "AlgoDestroy").apply { isDaemon = true }.start()
+            }
+        }
+
         // Page contents (see buildStateViews).
         lateinit var bioPage: LinearLayout
         lateinit var bioHeader: TextView
@@ -361,7 +429,7 @@ class MainActivity : Activity() {
     private var backendQueryMs = 0L
 
     // Data queue (mac + batch) drained by the data worker.
-    private class QueuedBatch(val mac: String, val data: SensorData)
+    private class QueuedBatch(val mac: String, val data: SensorData, val cloned: Boolean)
     private val dataQueue = ArrayBlockingQueue<QueuedBatch>(DATA_QUEUE_CAPACITY)
     private val dataWorkerStop = AtomicBoolean(false)
     private var dataWorker: Thread? = null
@@ -384,6 +452,7 @@ class MainActivity : Activity() {
                     st.updateActualRates()
                 }
                 updateStats()
+                refreshRelax(st)
             }
             maybeSubmitSpectra()
             pollBackendLabel()
@@ -397,13 +466,17 @@ class MainActivity : Activity() {
         if (backendQueryPending || nowMs - backendQueryMs < 1000) return
         backendQueryPending = true
         backendQueryMs = nowMs
-        controller.getParam("BACK_END") { result, _ ->
-            mainHandler.post {
-                backendQueryPending = false
-                if (!result.startsWith("Error") && result != shownBackend) {
+        scope.launch {
+            try {
+                val result = controller.getParam("BACK_END")
+                if (result != shownBackend) {
                     shownBackend = result
-                    sdkText.text = "SDK: ${controller.version} | Backend: $shownBackend"
+                    sdkText.text = "SDK: ${controller.version} | " +
+                            "Algo: ${SensorAlgo.getAlgoCapiVersion()} | Backend: $shownBackend"
                 }
+            } catch (_: Exception) {
+            } finally {
+                backendQueryPending = false
             }
         }
     }
@@ -430,7 +503,9 @@ class MainActivity : Activity() {
 
         controller = SensorController.getInstance()
         title = "SensorCapiKtDemo v$DEMO_VERSION (SDK ${controller.version})"
-        sdkText.text = "SDK: ${controller.version}"
+        sdkText.text = "SDK: ${controller.version} | Algo: ${SensorAlgo.getAlgoCapiVersion()}"
+        // Aggregate NTF_IMU batches by default (the algo feed needs them).
+        scope.launch { runCatching { controller.setParam("TRANSLATE_IMU", "False") } }
         // Session log dir: set before enabling the debug log and registering
         // the BLE bridge.
         if (debugLogEnabled) {
@@ -631,7 +706,11 @@ class MainActivity : Activity() {
         cloneCheck = CheckBox(this).apply {
             text = "Clone Data"
             isChecked = false
-            setOnCheckedChangeListener { _, isChecked -> cloneData = isChecked }
+            setOnCheckedChangeListener { _, isChecked ->
+                cloneData = isChecked
+                val states = synchronized(deviceStates) { deviceStates.values.toList() }
+                for (s in states) s.recreateAlgo(isChecked)
+            }
         }
         page.addView(cloneCheck)
 
@@ -655,10 +734,10 @@ class MainActivity : Activity() {
             isChecked = true
             setOnCheckedChangeListener { _, isChecked -> onBinDataToggled(isChecked) }
         }
-        // Translate IMU switch, default ON.
+        // Translate IMU switch, default OFF (aggregate NTF_IMU).
         translateImuCheck = CheckBox(this).apply {
             text = "Translate IMU (split ACC/GYRO/EULER/QUAT)"
-            isChecked = true
+            isChecked = false
             setOnCheckedChangeListener { _, isChecked -> onTranslateImuToggled(isChecked) }
         }
         debugRow.addView(debugLogCheck)
@@ -931,6 +1010,7 @@ class MainActivity : Activity() {
                                     isReplay: Boolean): DeviceUiState {
         val st = DeviceUiState(mac, profile, isReplay)
         st.liveFilter.setBand(filterBand)
+        st.recreateAlgo(cloneData)
         buildStateViews(st)
         synchronized(deviceStates) { deviceStates[mac] = st }
         refreshDeviceList()
@@ -940,6 +1020,8 @@ class MainActivity : Activity() {
     // Drops a device state (disconnect / replay end).
     private fun removeDeviceState(mac: String) {
         val st = synchronized(deviceStates) { deviceStates.remove(mac) } ?: return
+        closeAlgoCsv(st)
+        st.destroyAlgo()
         bioPageContainer.removeView(st.bioPage)
         imuPageContainer.removeView(st.imuPage)
         refreshDeviceList()
@@ -979,8 +1061,10 @@ class MainActivity : Activity() {
                 greyOutControls()
                 syncSampleRateCheckedFromInfo(st, st.info)
             } else if (st.profile != null) {
-                syncSwitches(st.profile)
-                syncSampleRateControls(st.profile)
+                scope.launch {
+                    syncSwitches(st.profile)
+                    syncSampleRateControls(st.profile)
+                }
             }
         }
         updatePageControls()
@@ -1008,6 +1092,7 @@ class MainActivity : Activity() {
     private fun showBioPlaceholder(st: DeviceUiState, text: String) {
         st.bioMode = BioMode.NONE
         st.bioFeeds = emptyList()
+        st.relaxView = null
         st.bioHeader.text = "Waveform (auto: EMG / EEG / PPG)"
         for (v in st.bioSlots) {
             v.title = ""
@@ -1066,6 +1151,7 @@ class MainActivity : Activity() {
                           brthCh: Int, ppgCh: Int, spo2Ch: Int, emgCh: Int, magCh: Int) {
         st.bioMode = mode
         st.lastBioCounts = intArrayOf(eegCh, ecgCh, brthCh, ppgCh, spo2Ch, emgCh, magCh)
+        st.relaxView = null
         Log.i(TAG, "layoutBio[${st.mac}]: $mode eeg=$eegCh ecg=$ecgCh brth=$brthCh " +
                 "ppg=$ppgCh spo2=$spo2Ch emg=$emgCh mag=$magCh page=${st.bioPageIndex}")
         val feeds = ArrayList<BioFeed>()
@@ -1130,9 +1216,13 @@ class MainActivity : Activity() {
                 }
             }
             BioMode.PPG -> {
-                // Fixed plot set: EEG fp1/fp2 + PPG red/ir led + SpO2
-                // spo2/heart_rate.
-                st.bioHeader.text = "EEG + PPG + SpO2 Waveform"
+                // RELAX row first, then the fixed plot set: EEG fp1/fp2 +
+                // PPG red/ir led + SpO2 spo2/heart_rate. The RELAX and SpO2
+                // rows stay full-width.
+                st.bioHeader.text = "RELAX + EEG + PPG + SpO2 Waveform"
+                bindSlot(st, 0, RELAX_FEED_TYPE, 0, "RELAX", 0, -1, feeds)
+                st.bioSlots[0].placeholder = waiting
+                st.relaxView = st.bioSlots[0]
                 val plots = arrayOf(
                     intArrayOf(DataType.NTF_EEG, 0), intArrayOf(DataType.NTF_EEG, 1),
                     intArrayOf(DataType.NTF_PPG, 0), intArrayOf(DataType.NTF_PPG, 1),
@@ -1140,10 +1230,11 @@ class MainActivity : Activity() {
                 )
                 val labels = arrayOf("fp1", "fp2", "red_led", "ir_led", "spo2", "heart_rate")
                 val counts = intArrayOf(eegCh, ppgCh, spo2Ch)
-                for (i in 0 until BIO_SLOT_COUNT) {
-                    if (i < plots.size) {
-                        val type = plots[i][0]
-                        val ch = plots[i][1]
+                for (i in 1 until BIO_SLOT_COUNT) {
+                    val p = i - 1
+                    if (p < plots.size) {
+                        val type = plots[p][0]
+                        val ch = plots[p][1]
                         val available = when (type) {
                             DataType.NTF_EEG -> counts[0]
                             DataType.NTF_PPG -> counts[1]
@@ -1153,7 +1244,7 @@ class MainActivity : Activity() {
                             val imp = if (type == DataType.NTF_EEG) IMP_EEG else -1
                             // SpO2 rows (low-rate derived values) stay
                             // full-width.
-                            bindSlot(st, i, type, ch, labels[i], i, imp, feeds,
+                            bindSlot(st, i, type, ch, labels[p], i, imp, feeds,
                                 withSpectrum = type != DataType.NTF_SPO2)
                         } else {
                             unbindSlot(st, i, waiting)
@@ -1476,11 +1567,11 @@ class MainActivity : Activity() {
                 return
             }
         }
-        connectDevice(mac, restoreParams = false)
+        scope.launch { connectDevice(mac, restoreParams = false) }
     }
 
     // Connect + init + stream; each step skips itself when already done.
-    private fun connectDevice(mac: String, restoreParams: Boolean) {
+    private suspend fun connectDevice(mac: String, restoreParams: Boolean) {
         // Stop the scan loop before connecting.
         if (scanning) {
             scanning = false
@@ -1494,107 +1585,108 @@ class MainActivity : Activity() {
             return
         }
         connectBtn.isEnabled = false
-        scope.launch {
-            try {
-                val dev = devices[mac]
-                setStatus("Connecting ${dev?.name ?: ""} [$mac] ...")
-                val prof = controller.requireSensor(mac)
-                appLog("User: connect ${dev?.name ?: ""} ($mac)", "I", prof)
-                if (prof == null) {
-                    appLog("App: failed to create SensorProfile for $mac", "E")
-                    setStatus("requireSensor failed")
-                    updateConnectButton()
-                    return@launch
-                }
-                // New connections inherit the current Auto Reconnect toggle.
-                prof.autoReconnect = autoReconnect
-                val kept = synchronized(deviceStates) { deviceStates[mac] }
-                val st = if (kept != null && !kept.isReplay && kept.profile === prof) {
-                    kept
-                } else {
-                    registerDeviceState(mac, prof, isReplay = false).also { attachListeners(it) }
-                }
-
-                if (!prof.isReady() && !prof.connect()) {
-                    appLog("App: failed to connect to ${dev?.name ?: ""} ($mac)", "E", prof)
-                    setStatus("Connect failed")
-                    removeDeviceState(mac)
-                    updateConnectButton()
-                    return@launch
-                }
-                if (!prof.hasInited()) {
-                    setStatus("Connected, init ...")
-                    // batch 32 samples/channel, 5 s init timeout, battery poll 60 s
-                    if (!prof.init(32, 5000, 60000)) {
-                        appLog("App: failed to initialize ${dev?.name ?: ""} ($mac)", "E", prof)
-                        setStatus("Init failed")
-                        removeDeviceState(mac)
-                        updateConnectButton()
-                        return@launch
-                    }
-                }
-                val info = prof.getDeviceInfo()
-                st.info = info
-                setStatus("Init ok: $info")
-                Log.i(TAG, "init ok[$mac]: name=${info.deviceName} EMG=${info.emgChannelCount}ch@${info.emgSampleRate} " +
-                        "EEG=${info.eegChannelCount}ch@${info.eegSampleRate} ECG=${info.ecgChannelCount} " +
-                        "BRTH=${info.brthChannelCount} PPG=${info.ppgChannelCount}ch@${info.ppgSampleRate} " +
-                        "SPO2=${info.spo2ChannelCount}ch@${info.spo2SampleRate} IMU=${info.imuChannelCount}ch@${info.imuSampleRate}")
-                // Session params follow the debug toggles.
-                if (debugLogEnabled) {
-                    val rc = prof.setParam("DEBUG_LOG_PATH", "True")
-                    Log.i(TAG, "setParam DEBUG_LOG_PATH=True -> $rc")
-                    prof.log("App: setParam(DEBUG_LOG_PATH, True) -> $rc", "I")
-                }
-                if (binDataEnabled) {
-                    val rc = prof.setParam("DEBUG_BLE_DATA_PATH", "True")
-                    Log.i(TAG, "setParam DEBUG_BLE_DATA_PATH=True -> $rc")
-                    prof.log("App: setParam(DEBUG_BLE_DATA_PATH, True) -> $rc", "I")
-                }
-                // Bio page mode from DeviceInfo.
-                synchronized(st.bioChannels) {
-                    st.bioChannels.clear()
-                    if (info.eegChannelCount > 0) st.bioChannels[DataType.NTF_EEG] = info.eegChannelCount
-                    if (info.ecgChannelCount > 0) st.bioChannels[DataType.NTF_ECG] = info.ecgChannelCount
-                    if (info.brthChannelCount > 0) st.bioChannels[DataType.NTF_BRTH] = info.brthChannelCount
-                    if (info.ppgChannelCount > 0) st.bioChannels[DataType.NTF_PPG] = info.ppgChannelCount
-                    if (info.spo2ChannelCount > 0) st.bioChannels[DataType.NTF_SPO2] = info.spo2ChannelCount
-                    if (info.emgChannelCount > 0) st.bioChannels[DataType.NTF_EMG] = info.emgChannelCount
-                    if (info.magAngleChannelCount > 0) st.bioChannels[DataType.NTF_MAG_ANGLE] = info.magAngleChannelCount
-                }
-                val mode = detectBioMode(info)
-                if (mode != BioMode.NONE) {
-                    layoutBio(st, mode, info.eegChannelCount, info.ecgChannelCount,
-                        info.brthChannelCount, info.ppgChannelCount, info.spo2ChannelCount,
-                        info.emgChannelCount, info.magAngleChannelCount)
-                } else {
-                    resetBio(st)
-                }
-                // The just-connected device becomes the current one.
-                setCurrentDevice(mac)
-
-                if (!prof.isDataTransfering() && !prof.startDataNotification()) {
-                    appLog("App: failed to start data stream on $mac", "E", prof)
-                    setStatus("startDataNotification failed")
-                    removeDeviceState(mac)
-                    updateConnectButton()
-                    return@launch
-                }
-                // New data session: clear the device's views.
-                clearDataViews(st)
-                appLog("App: device connected and streaming: ${dev?.name ?: ""} ($mac)", "I", prof)
-                setStatus("Streaming $mac ...")
-                if (restoreParams) {
-                    for ((key, value) in savedParamsByMac[mac].orEmpty()) {
-                        val result = prof.setParam(key, value)
-                        prof.log("App: restore setParam($key, $value) -> $result", "I")
-                    }
-                    syncSwitches(prof)
-                    syncSampleRateControls(prof)
-                }
-            } finally {
+        try {
+            val dev = devices[mac]
+            setStatus("Connecting ${dev?.name ?: ""} [$mac] ...")
+            val prof = controller.requireSensor(mac)
+            appLog("User: connect ${dev?.name ?: ""} ($mac)", "I", prof)
+            if (prof == null) {
+                appLog("App: failed to create SensorProfile for $mac", "E")
+                setStatus("requireSensor failed")
                 updateConnectButton()
+                return
             }
+            // New connections inherit the current Auto Reconnect toggle.
+            prof.autoReconnect = autoReconnect
+            val kept = synchronized(deviceStates) { deviceStates[mac] }
+            val st = if (kept != null && !kept.isReplay && kept.profile === prof) {
+                kept
+            } else {
+                registerDeviceState(mac, prof, isReplay = false).also { attachListeners(it) }
+            }
+
+            if (!prof.isReady() && !prof.connect()) {
+                appLog("App: failed to connect to ${dev?.name ?: ""} ($mac)", "E", prof)
+                setStatus("Connect failed")
+                removeDeviceState(mac)
+                updateConnectButton()
+                return
+            }
+            if (!prof.hasInited()) {
+                setStatus("Connected, init ...")
+                // batch 32 samples/channel, 5 s init timeout, battery poll 60 s
+                if (!prof.init(32, 5000, 60000)) {
+                    appLog("App: failed to initialize ${dev?.name ?: ""} ($mac)", "E", prof)
+                    setStatus("Init failed")
+                    removeDeviceState(mac)
+                    updateConnectButton()
+                    return
+                }
+            }
+            val info = prof.getDeviceInfo()
+            st.info = info
+            setStatus("Init ok: $info")
+            Log.i(TAG, "init ok[$mac]: name=${info.deviceName} EMG=${info.emgChannelCount}ch@${info.emgSampleRate} " +
+                    "EEG=${info.eegChannelCount}ch@${info.eegSampleRate} ECG=${info.ecgChannelCount} " +
+                    "BRTH=${info.brthChannelCount} PPG=${info.ppgChannelCount}ch@${info.ppgSampleRate} " +
+                    "SPO2=${info.spo2ChannelCount}ch@${info.spo2SampleRate} IMU=${info.imuChannelCount}ch@${info.imuSampleRate}")
+            // Session params follow the debug toggles.
+            if (debugLogEnabled) {
+                val rc = runCatching { prof.setParam("DEBUG_LOG_PATH", "True") }
+                Log.i(TAG, "setParam DEBUG_LOG_PATH=True -> ${rc.getOrElse { it.message }}")
+                prof.log("App: setParam(DEBUG_LOG_PATH, True) -> ${rc.getOrElse { it.message }}", "I")
+                // The Relax CSV sits next to the resolved device log file.
+                val logPath = runCatching { prof.getParam("DEBUG_LOG_PATH") }.getOrNull()
+                if (logPath != null) openAlgoCsv(st, logPath)
+            }
+            if (binDataEnabled) {
+                val rc = runCatching { prof.setParam("DEBUG_BLE_DATA_PATH", "True") }
+                Log.i(TAG, "setParam DEBUG_BLE_DATA_PATH=True -> ${rc.getOrElse { it.message }}")
+                prof.log("App: setParam(DEBUG_BLE_DATA_PATH, True) -> ${rc.getOrElse { it.message }}", "I")
+            }
+            // Bio page mode from DeviceInfo.
+            synchronized(st.bioChannels) {
+                st.bioChannels.clear()
+                if (info.eegChannelCount > 0) st.bioChannels[DataType.NTF_EEG] = info.eegChannelCount
+                if (info.ecgChannelCount > 0) st.bioChannels[DataType.NTF_ECG] = info.ecgChannelCount
+                if (info.brthChannelCount > 0) st.bioChannels[DataType.NTF_BRTH] = info.brthChannelCount
+                if (info.ppgChannelCount > 0) st.bioChannels[DataType.NTF_PPG] = info.ppgChannelCount
+                if (info.spo2ChannelCount > 0) st.bioChannels[DataType.NTF_SPO2] = info.spo2ChannelCount
+                if (info.emgChannelCount > 0) st.bioChannels[DataType.NTF_EMG] = info.emgChannelCount
+                if (info.magAngleChannelCount > 0) st.bioChannels[DataType.NTF_MAG_ANGLE] = info.magAngleChannelCount
+            }
+            val mode = detectBioMode(info)
+            if (mode != BioMode.NONE) {
+                layoutBio(st, mode, info.eegChannelCount, info.ecgChannelCount,
+                    info.brthChannelCount, info.ppgChannelCount, info.spo2ChannelCount,
+                    info.emgChannelCount, info.magAngleChannelCount)
+            } else {
+                resetBio(st)
+            }
+            // The just-connected device becomes the current one.
+            setCurrentDevice(mac)
+
+            if (!prof.isDataTransfering() && !prof.startDataNotification()) {
+                appLog("App: failed to start data stream on $mac", "E", prof)
+                setStatus("startDataNotification failed")
+                removeDeviceState(mac)
+                updateConnectButton()
+                return
+            }
+            // New data session: clear the device's views.
+            clearDataViews(st)
+            appLog("App: device connected and streaming: ${dev?.name ?: ""} ($mac)", "I", prof)
+            setStatus("Streaming $mac ...")
+            if (restoreParams) {
+                for ((key, value) in savedParamsByMac[mac].orEmpty()) {
+                    val result = runCatching { prof.setParam(key, value) }
+                    prof.log("App: restore setParam($key, $value) -> ${result.getOrElse { it.message }}", "I")
+                }
+                syncSwitches(prof)
+                syncSampleRateControls(prof)
+            }
+        } finally {
+            updateConnectButton()
         }
     }
 
@@ -1608,7 +1700,7 @@ class MainActivity : Activity() {
                 "Selected: ${sortedDevices.getOrNull(idx)?.name ?: "replay"} [$mac]"
             listAdapter.notifyDataSetChanged()
         }
-        connectDevice(mac, restoreParams = restore)
+        scope.launch { connectDevice(mac, restoreParams = restore) }
     }
 
     private fun attachListeners(st: DeviceUiState) {
@@ -1665,6 +1757,7 @@ class MainActivity : Activity() {
         p.setOnDataTransferStateChangeListener { _, isTransferring ->
             // Stream on/off signal.
             st.transferring = isTransferring
+            if (isTransferring) resetAlgo(st)
             appLog("App: data stream ${if (isTransferring) "ON" else "OFF"} $mac", "I", p)
             mainHandler.post { refreshDeviceList(); updateConnectButton() }
         }
@@ -1674,9 +1767,9 @@ class MainActivity : Activity() {
     // Data listener entry for live and replay profiles alike: enqueue only.
     private fun onSensorData(mac: String, dataList: List<SensorData>) {
         if (cloneData) {
-            for (d in dataList) enqueueData(QueuedBatch(mac, d.clone()))
+            for (d in dataList) enqueueData(QueuedBatch(mac, d.clone(), true))
         } else {
-            for (d in dataList) enqueueData(QueuedBatch(mac, d))
+            for (d in dataList) enqueueData(QueuedBatch(mac, d, false))
         }
     }
 
@@ -1696,7 +1789,7 @@ class MainActivity : Activity() {
                 } catch (e: InterruptedException) {
                     break
                 }
-                processBatches(q.mac, listOf(q.data))
+                processBatches(q.mac, listOf(q.data), q.cloned)
             }
         }, "SensorDataWorker").apply {
             isDaemon = true
@@ -1746,35 +1839,29 @@ class MainActivity : Activity() {
         appLog("User: multi start on ${sensors.size} device(s)")
         multiOpActive = true
         multiBtn.isEnabled = false
-        val transferring = sensors.filter { it.isDataTransfering() }
-        if (transferring.isNotEmpty()) {
-            controller.multiStopDataNotification(transferring, 10000) { results, _ ->
+        scope.launch {
+            val transferring = sensors.filter { it.isDataTransfering() }
+            if (transferring.isNotEmpty()) {
+                val (results, _) = controller.multiStopDataNotification(transferring, 10000)
                 val stopFailed = results.filterValues { !it }.keys
                 if (stopFailed.isNotEmpty()) {
                     val macs = stopFailed.joinToString(", ")
                     appLog("App: multi stop failed on: $macs", "W")
-                    mainHandler.post {
-                        setStatus("Multi stop failed on: $macs")
-                        multiOpActive = false
-                        updateConnectButton()
-                    }
-                    return@multiStopDataNotification
+                    setStatus("Multi stop failed on: $macs")
+                    multiOpActive = false
+                    updateConnectButton()
+                    return@launch
                 }
-                doMultiStart(sensors)
             }
-            return
+            doMultiStart(sensors)
         }
-        doMultiStart(sensors)
     }
 
-    private fun doMultiStart(sensors: List<SensorProfile>) {
-        controller.multiStartDataNotification(sensors, 0, -1, 1) { results, errors ->
-            mainHandler.post {
-                reportMultiResult("start", "started", results, errors)
-                multiOpActive = false
-                updateConnectButton()
-            }
-        }
+    private suspend fun doMultiStart(sensors: List<SensorProfile>) {
+        val (results, errors) = controller.multiStartDataNotification(sensors, 0, -1, 1)
+        reportMultiResult("start", "started", results, errors)
+        multiOpActive = false
+        updateConnectButton()
     }
 
     // Multi-device stream stop flow.
@@ -1792,12 +1879,11 @@ class MainActivity : Activity() {
         appLog("User: multi stop on ${sensors.size} device(s)")
         multiOpActive = true
         multiBtn.isEnabled = false
-        controller.multiStopDataNotification(sensors, 10000) { results, errors ->
-            mainHandler.post {
-                reportMultiResult("stop", "stopped", results, errors)
-                multiOpActive = false
-                updateConnectButton()
-            }
+        scope.launch {
+            val (results, errors) = controller.multiStopDataNotification(sensors, 10000)
+            reportMultiResult("stop", "stopped", results, errors)
+            multiOpActive = false
+            updateConnectButton()
         }
     }
 
@@ -1832,11 +1918,17 @@ class MainActivity : Activity() {
         val p = st?.profile ?: return
         if (st.isReplay) return
         scope.launch {
-            val result = p.setParam(key, if (on) "ON" else "OFF")
-            setStatus("setParam $key=${if (on) "ON" else "OFF"} -> $result")
-            appLog("User: setParam($key, ${if (on) "ON" else "OFF"}) -> $result", "I", p)
-            recordSavedParam(st.mac, key, if (on) "ON" else "OFF", result)
-            if (!result.startsWith("Error")) clearDataViews(st)
+            val value = if (on) "ON" else "OFF"
+            try {
+                val result = p.setParam(key, value)
+                setStatus("setParam $key=$value -> $result")
+                appLog("User: setParam($key, $value) -> $result", "I", p)
+                recordSavedParam(st.mac, key, value, result)
+                clearDataViews(st)
+            } catch (e: Exception) {
+                setStatus("setParam $key=$value failed: ${e.message}")
+                appLog("User: setParam($key, $value) failed: ${e.message}", "E", p)
+            }
             // Re-query all switches after every toggle.
             syncSwitches(p)
         }
@@ -1848,11 +1940,17 @@ class MainActivity : Activity() {
         val p = st?.profile ?: return
         if (st.isReplay) return
         scope.launch {
-            val result = p.setParam(key, if (on) "ON" else "OFF")
-            setStatus("setParam $key=${if (on) "ON" else "OFF"} -> $result")
-            appLog("User: setParam($key, ${if (on) "ON" else "OFF"}) -> $result", "I", p)
-            recordSavedParam(st.mac, key, if (on) "ON" else "OFF", result)
-            if (!result.startsWith("Error")) clearDataViews(st)
+            val value = if (on) "ON" else "OFF"
+            try {
+                val result = p.setParam(key, value)
+                setStatus("setParam $key=$value -> $result")
+                appLog("User: setParam($key, $value) -> $result", "I", p)
+                recordSavedParam(st.mac, key, value, result)
+                clearDataViews(st)
+            } catch (e: Exception) {
+                setStatus("setParam $key=$value failed: ${e.message}")
+                appLog("User: setParam($key, $value) failed: ${e.message}", "E", p)
+            }
             syncSwitches(p)
         }
     }
@@ -1872,49 +1970,47 @@ class MainActivity : Activity() {
 
     // Reads back the NTF and FILTER aggregates ("K|V|K|V") and syncs the
     // boxes.
-    private fun syncSwitches(p: SensorProfile) {
-        scope.launch {
-            val ntfResult = p.getParam("NTF")
-            val filterResult = p.getParam("FILTER")
-            val info = p.getDeviceInfo()
-            val channelMap = mapOf(
-                "NTF_EEG" to info.eegChannelCount,
-                "NTF_EMG" to info.emgChannelCount,
-                // Gesture depends on EMG sampling, so it shares the EMG count.
-                "NTF_GEST" to info.emgChannelCount,
-                "NTF_PPG" to info.ppgChannelCount,
-                "NTF_SPO2" to info.spo2ChannelCount,
-                "NTF_IMU" to maxOf(info.accChannelCount, info.gyroChannelCount),
-                "NTF_MAG_ANGLE" to info.magAngleChannelCount,
-                "NTF_IMPEDANCE" to info.impeChannelCount,
-            )
-            val ntfValues = parseAggregate(ntfResult)
-            val filterValues = parseAggregate(filterResult)
-            val hasState = ntfValues.isNotEmpty()
-            val hasFilter = !filterResult.startsWith("Error") && filterResult.isNotEmpty()
-            suppressNtfCallbacks = true
-            for ((key, cb) in ntfChecks) {
-                val supported = (channelMap[key] ?: 0) > 0
-                cb.visibility = if (supported || !hasState) View.VISIBLE else View.GONE
-                cb.isEnabled = supported
-                cb.isChecked = supported && ntfValues[key] == "ON"
-            }
-            for ((key, cb) in filterChecks) {
-                cb.isEnabled = hasFilter
-                cb.isChecked = hasFilter && filterValues[key] == "ON"
-            }
-            suppressNtfCallbacks = false
-            deviceStates.values.firstOrNull { it.profile === p }?.let { st ->
-                st.impedanceEnabled =
-                    (channelMap["NTF_IMPEDANCE"] ?: 0) > 0 && ntfValues["NTF_IMPEDANCE"] == "ON"
-            }
-            Log.i(TAG, "ntf readback: \"$ntfResult\" -> " + ntfChecks.map { (k, cb) ->
-                "$k=${if (cb.isEnabled) "en" else "dis"}/${if (cb.isChecked) "on" else "off"}" +
-                        "${if (cb.visibility != View.VISIBLE) "/gone" else ""}"
-            } + " | filter readback: \"$filterResult\" -> " + filterChecks.map { (k, cb) ->
-                "$k=${if (cb.isEnabled) "en" else "dis"}/${if (cb.isChecked) "on" else "off"}"
-            })
+    private suspend fun syncSwitches(p: SensorProfile) {
+        val ntfResult = runCatching { p.getParam("NTF") }.getOrElse { "Error: ${it.message}" }
+        val filterResult = runCatching { p.getParam("FILTER") }.getOrElse { "Error: ${it.message}" }
+        val info = p.getDeviceInfo()
+        val channelMap = mapOf(
+            "NTF_EEG" to info.eegChannelCount,
+            "NTF_EMG" to info.emgChannelCount,
+            // Gesture depends on EMG sampling, so it shares the EMG count.
+            "NTF_GEST" to info.emgChannelCount,
+            "NTF_PPG" to info.ppgChannelCount,
+            "NTF_SPO2" to info.spo2ChannelCount,
+            "NTF_IMU" to maxOf(info.accChannelCount, info.gyroChannelCount),
+            "NTF_MAG_ANGLE" to info.magAngleChannelCount,
+            "NTF_IMPEDANCE" to info.impeChannelCount,
+        )
+        val ntfValues = parseAggregate(ntfResult)
+        val filterValues = parseAggregate(filterResult)
+        val hasState = ntfValues.isNotEmpty()
+        val hasFilter = !filterResult.startsWith("Error") && filterResult.isNotEmpty()
+        suppressNtfCallbacks = true
+        for ((key, cb) in ntfChecks) {
+            val supported = (channelMap[key] ?: 0) > 0
+            cb.visibility = if (supported || !hasState) View.VISIBLE else View.GONE
+            cb.isEnabled = supported
+            cb.isChecked = supported && ntfValues[key] == "ON"
         }
+        for ((key, cb) in filterChecks) {
+            cb.isEnabled = hasFilter
+            cb.isChecked = hasFilter && filterValues[key] == "ON"
+        }
+        suppressNtfCallbacks = false
+        deviceStates.values.firstOrNull { it.profile === p }?.let { st ->
+            st.impedanceEnabled =
+                (channelMap["NTF_IMPEDANCE"] ?: 0) > 0 && ntfValues["NTF_IMPEDANCE"] == "ON"
+        }
+        Log.i(TAG, "ntf readback: \"$ntfResult\" -> " + ntfChecks.map { (k, cb) ->
+            "$k=${if (cb.isEnabled) "en" else "dis"}/${if (cb.isChecked) "on" else "off"}" +
+                    "${if (cb.visibility != View.VISIBLE) "/gone" else ""}"
+        } + " | filter readback: \"$filterResult\" -> " + filterChecks.map { (k, cb) ->
+            "$k=${if (cb.isEnabled) "en" else "dis"}/${if (cb.isChecked) "on" else "off"}"
+        })
     }
 
     // ---- debug log / bin data / auto reconnect toggles ------------------------
@@ -1924,8 +2020,10 @@ class MainActivity : Activity() {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val version = controller.version.replace('.', '_')
         sessionLogDir = "/sdcard/Documents/sensorsdklog/${stamp}_$version"
-        controller.setParam("LOG_PATH", sessionLogDir!!, null)
-        controller.setParam("DEBUG_ENABLED", "True", null)
+        scope.launch {
+            runCatching { controller.setParam("LOG_PATH", sessionLogDir!!) }
+            runCatching { controller.setParam("DEBUG_ENABLED", "True") }
+        }
         Log.i(TAG, "LOG_PATH -> $sessionLogDir")
     }
 
@@ -2026,13 +2124,22 @@ class MainActivity : Activity() {
         if (checked) {
             applySdkDebugLog()
         } else {
-            controller.setParam("DEBUG_ENABLED", "False", null)
+            scope.launch { runCatching { controller.setParam("DEBUG_ENABLED", "False") } }
+            val states = synchronized(deviceStates) { deviceStates.values.toList() }
+            for (s in states) closeAlgoCsv(s)
         }
         val value = if (checked) "True" else "False"
         for (p in readyProfiles()) {
             scope.launch {
-                val result = p.setParam("DEBUG_LOG_PATH", value)
-                p.log("App: setParam(DEBUG_LOG_PATH, $value) -> $result", "I")
+                val result = runCatching { p.setParam("DEBUG_LOG_PATH", value) }
+                p.log("App: setParam(DEBUG_LOG_PATH, $value) -> ${result.getOrElse { it.message }}", "I")
+                if (checked && result.isSuccess) {
+                    val st = synchronized(deviceStates) {
+                        deviceStates.values.firstOrNull { it.profile === p }
+                    }
+                    val logPath = runCatching { p.getParam("DEBUG_LOG_PATH") }.getOrNull()
+                    if (st != null && logPath != null) openAlgoCsv(st, logPath)
+                }
             }
         }
     }
@@ -2043,8 +2150,8 @@ class MainActivity : Activity() {
         val value = if (checked) "True" else "False"
         for (p in readyProfiles()) {
             scope.launch {
-                val result = p.setParam("DEBUG_BLE_DATA_PATH", value)
-                p.log("App: setParam(DEBUG_BLE_DATA_PATH, $value) -> $result", "I")
+                val result = runCatching { p.setParam("DEBUG_BLE_DATA_PATH", value) }
+                p.log("App: setParam(DEBUG_BLE_DATA_PATH, $value) -> ${result.getOrElse { it.message }}", "I")
             }
         }
     }
@@ -2052,10 +2159,9 @@ class MainActivity : Activity() {
     private fun onTranslateImuToggled(checked: Boolean) {
         val value = if (checked) "True" else "False"
         appLog("User: translate IMU ${if (checked) "ON" else "OFF"}")
-        controller.setParam("TRANSLATE_IMU", value) { result, _ ->
-            mainHandler.post {
-                appLog("App: setParam(TRANSLATE_IMU, $value) -> $result")
-            }
+        scope.launch {
+            val result = runCatching { controller.setParam("TRANSLATE_IMU", value) }
+            appLog("App: setParam(TRANSLATE_IMU, $value) -> ${result.getOrElse { it.message }}")
         }
     }
 
@@ -2075,11 +2181,16 @@ class MainActivity : Activity() {
         val p = st?.profile ?: return
         if (st.isReplay) return
         scope.launch {
-            val result = p.setParam(key, rate.toString())
-            setStatus("setParam $key=$rate -> $result")
-            appLog("User: setParam($key, $rate) -> $result", "I", p)
-            recordSavedParam(st.mac, key, rate.toString(), result)
-            if (!result.startsWith("Error")) clearDataViews(st)
+            try {
+                val result = p.setParam(key, rate.toString())
+                setStatus("setParam $key=$rate -> $result")
+                appLog("User: setParam($key, $rate) -> $result", "I", p)
+                recordSavedParam(st.mac, key, rate.toString(), result)
+                clearDataViews(st)
+            } catch (e: Exception) {
+                setStatus("setParam $key=$rate failed: ${e.message}")
+                appLog("User: setParam($key, $rate) failed: ${e.message}", "E", p)
+            }
             // Re-query so the buttons track the device state after the switch.
             syncSampleRateControls(p)
         }
@@ -2087,24 +2198,22 @@ class MainActivity : Activity() {
 
     // Reads back the sample rate options and the bound rates, caches them
     // per device and syncs the radio rows of the current device.
-    private fun syncSampleRateControls(p: SensorProfile) {
-        scope.launch {
-            val read = LinkedHashMap<String, Pair<List<Int>, Int>>()
+    private suspend fun syncSampleRateControls(p: SensorProfile) {
+        val read = LinkedHashMap<String, Pair<List<Int>, Int>>()
+        for (c in sampleRateControls) {
+            val options = runCatching { p.getParam("${c.key}_LIST") }.getOrDefault("")
+                .split("|").mapNotNull { it.toIntOrNull() }
+            val current = runCatching { p.getParam(c.key) }.getOrNull()?.toIntOrNull() ?: 0
+            read[c.key] = options to current
+        }
+        val st = synchronized(deviceStates) {
+            deviceStates.values.firstOrNull { it.profile === p }
+        }
+        if (st != null) st.sampleRateStates.putAll(read)
+        if (st != null && st.mac == currentMac) {
             for (c in sampleRateControls) {
-                val options = p.getParam("${c.key}_LIST")
-                    .split("|").mapNotNull { it.toIntOrNull() }
-                val current = p.getParam(c.key).toIntOrNull() ?: 0
-                read[c.key] = options to current
-            }
-            val st = synchronized(deviceStates) {
-                deviceStates.values.firstOrNull { it.profile === p }
-            }
-            if (st != null) st.sampleRateStates.putAll(read)
-            if (st != null && st.mac == currentMac) {
-                for (c in sampleRateControls) {
-                    val (options, current) = read[c.key] ?: continue
-                    c.sync(options, current)
-                }
+                val (options, current) = read[c.key] ?: continue
+                c.sync(options, current)
             }
         }
     }
@@ -2289,6 +2398,7 @@ class MainActivity : Activity() {
             // valid bin always pairs the ON from loadReplayConfig with the
             // OFF from endReplay).
             st.transferring = isTransferring
+            if (isTransferring) resetAlgo(st)
             appLog("App: data stream ${if (isTransferring) "ON" else "OFF"} $mac", "I", p)
             mainHandler.post {
                 refreshDeviceList()
@@ -2396,15 +2506,15 @@ class MainActivity : Activity() {
             "$path.csv"
         }
         scope.launch {
-            val result = controller.parseBinToCsvAsync(path, csv)
+            val result = runCatching { controller.parseBinToCsvAsync(path, csv) }
             analyzing = false
             analyzeBtn.isEnabled = true
-            if (result.startsWith("Error")) {
-                appLog("App: analyze failed: $result", "E")
-                setStatus("Analyze failed: $result")
-            } else {
-                appLog("App: CSV saved: $result")
-                setStatus("CSV saved: $result")
+            result.onSuccess {
+                appLog("App: CSV saved: $it")
+                setStatus("CSV saved: $it")
+            }.onFailure {
+                appLog("App: analyze failed: ${it.message}", "E")
+                setStatus("Analyze failed: ${it.message}")
             }
         }
     }
@@ -2412,7 +2522,7 @@ class MainActivity : Activity() {
     // ---- data processing ---------------------------------------------------------
 
     // Feeds one device's batch list into its views.
-    private fun processBatches(mac: String, dataList: List<SensorData>) {
+    private fun processBatches(mac: String, dataList: List<SensorData>, cloned: Boolean) {
         val st = synchronized(deviceStates) { deviceStates[mac] } ?: return
         for (d in dataList) {
             st.batches++
@@ -2482,12 +2592,157 @@ class MainActivity : Activity() {
                 }
                 else -> {} // impedance/ADS streams: counters only
             }
+            feedAlgo(st, d, cloned)
         }
         // Throttled per-batch logcat heartbeat.
         val now = System.currentTimeMillis()
         if (now - st.lastLogMs >= 1000) {
             st.lastLogMs = now
             Log.i(TAG, "data[$mac]: batches=${st.batches} samples=${st.samples} lostPkgs=${st.lostPackages}")
+        }
+    }
+
+    // Feeds one algo-eligible batch (NTF_EEG / NTF_IMU) into the device's
+    // algo controller.
+    private fun feedAlgo(st: DeviceUiState, d: SensorData, cloned: Boolean) {
+        if (d.dataType != DataType.NTF_EEG && d.dataType != DataType.NTF_IMU) return
+        if (st.algoFeedTypes.add(d.dataType)) {
+            appLog("App: algo feed type ${d.dataType}", "D", st.profile)
+        }
+        val param = if (cloned) "CLONE" else ""
+        synchronized(st.algoLock) {
+            st.algo?.pushSamples(arrayOf(d), param,
+                SensorProfile.OnCompletionListener { ok, error ->
+                    if (ok == 0) {
+                        appLog("App: algo push batch failed: $error", "W", st.profile)
+                    }
+                })
+        }
+    }
+
+    // Every data-transfer ON resets the device's algo controller and Relax
+    // ring before new data.
+    private fun resetAlgo(st: DeviceUiState) {
+        st.algoResetGeneration++
+        st.lastRelaxStep = 0uL
+        st.lastRelaxTimestamp = -1.0
+        st.lastRelaxValue = 0f
+        st.relaxView?.clear()
+        dataQueue.removeAll { it.mac == st.mac }
+        synchronized(st.algoLock) {
+            st.algo?.reset()
+        }
+    }
+
+    // Pending-guarded chain of getResult("NO_HEADER") reads: drains the algo
+    // result FIFO until STEP repeats; each new STEP appends one Relax point
+    // on the 50 Hz grid and one CSV row.
+    private fun refreshRelax(st: DeviceUiState) {
+        if (st.bioMode != BioMode.PPG || st.relaxQueryPending) return
+        st.relaxQueryPending = true
+        val generation = st.algoResetGeneration
+        scope.launch {
+            val result = suspendCoroutine<String?> { cont ->
+                synchronized(st.algoLock) {
+                    val a = st.algo
+                    if (a == null) {
+                        cont.resume(null)
+                    } else {
+                        a.getResult("NO_HEADER") { res, _ -> cont.resume(res) }
+                    }
+                }
+            }
+            st.relaxQueryPending = false
+            if (result == null) return@launch
+            if (generation != st.algoResetGeneration) {
+                refreshRelax(st)
+                return@launch
+            }
+            val fields = result.split('|')
+            if (fields.size != 6) return@launch
+            val step = fields[0].toULongOrNull() ?: return@launch
+            val timestamp = fields[1].toDoubleOrNull() ?: return@launch
+            val relax = fields[3].toFloatOrNull() ?: return@launch
+            if (step == st.lastRelaxStep) return@launch
+            val view = st.relaxView
+            if (step < st.lastRelaxStep) {
+                view?.clear()
+                st.lastRelaxTimestamp = -1.0
+            }
+            if (step > 0uL) {
+                if (view != null) {
+                    var slotCount = 1
+                    if (timestamp > 0.0 && st.lastRelaxTimestamp > 0.0) {
+                        val dt = timestamp - st.lastRelaxTimestamp
+                        if (dt > 0.0) {
+                            slotCount = (dt * RELAX_GRID_RATE).roundToInt()
+                                .coerceIn(1, RELAX_RING_SAMPLES)
+                        }
+                    }
+                    if (timestamp > 0.0) st.lastRelaxTimestamp = timestamp
+                    if (slotCount > 1) {
+                        val column = FloatArray(slotCount) { st.lastRelaxValue }
+                        column[slotCount - 1] = relax
+                        view.appendValues(0, column, RELAX_GRID_RATE)
+                    } else {
+                        view.appendValues(0, floatArrayOf(relax), RELAX_GRID_RATE)
+                    }
+                    st.lastRelaxValue = relax
+                }
+                appendAlgoCsvRow(st, fields, timestamp)
+                if (st.lastRelaxStep == 0uL) {
+                    appLog("App: algo first update STEP=$step RELAX=${fields[3]}", "D", st.profile)
+                }
+            }
+            st.lastRelaxStep = step
+            refreshRelax(st)
+        }
+    }
+
+    // Opens the Relax CSV next to the device's debug log file.
+    private fun openAlgoCsv(st: DeviceUiState, deviceLogPath: String) {
+        if (deviceLogPath.isEmpty() || deviceLogPath.startsWith("Error") ||
+            deviceLogPath == "True" || deviceLogPath == "False") return
+        val logFile = File(deviceLogPath)
+        val baseName = logFile.nameWithoutExtension
+        val dir = logFile.parentFile
+        if (baseName.isEmpty() || dir == null) return
+        val csvFile = File(dir, "$baseName.csv")
+        if (st.algoCsvWriter != null && st.algoCsvPath == csvFile.absolutePath) return
+        closeAlgoCsv(st)
+        try {
+            val writer = csvFile.bufferedWriter()
+            st.algoCsvWriter = writer
+            st.algoCsvPath = csvFile.absolutePath
+            writer.write("STEP,TIMESTAMP,VALID,RELAX,CONCENTRATE,POSITION\n")
+            writer.flush()
+        } catch (e: Exception) {
+            Log.w(TAG, "cannot open algo CSV: ${csvFile.absolutePath}", e)
+            st.algoCsvWriter = null
+            st.algoCsvPath = null
+        }
+    }
+
+    private fun closeAlgoCsv(st: DeviceUiState) {
+        try {
+            st.algoCsvWriter?.close()
+        } catch (_: Exception) {
+        }
+        st.algoCsvWriter = null
+        st.algoCsvPath = null
+    }
+
+    // One Relax CSV row per new STEP (TIMESTAMP at 3 decimals).
+    private fun appendAlgoCsvRow(st: DeviceUiState, fields: List<String>, timestamp: Double) {
+        val writer = st.algoCsvWriter ?: return
+        try {
+            val row = fields.toMutableList()
+            row[1] = String.format(Locale.US, "%.3f", timestamp)
+            writer.write(row.joinToString(","))
+            writer.write("\n")
+            writer.flush()
+        } catch (e: Exception) {
+            Log.w(TAG, "algo csv write failed: ${e.message}")
         }
     }
 
@@ -2674,6 +2929,7 @@ class MainActivity : Activity() {
         st.strength = -1
         st.streamStartTimeSecs.clear()
         st.streamDelayMs = 0
+        st.lastRelaxTimestamp = -1.0
     }
 
     private fun setStatus(s: String) {
@@ -2720,6 +2976,8 @@ class MainActivity : Activity() {
         }
         val states = synchronized(deviceStates) { deviceStates.values.toList() }
         for (st in states) {
+            closeAlgoCsv(st)
+            st.destroyAlgo()
             if (!st.isReplay) st.profile?.disconnect(null)
         }
         SensorController.terminate()

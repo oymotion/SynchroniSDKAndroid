@@ -176,6 +176,20 @@ class WaveformView @JvmOverloads constructor(
         }
     }
 
+    // Appends pre-computed values into one channel (algo result rows).
+    fun appendValues(channel: Int, vals: FloatArray, rate: Float) {
+        if (channel < 0 || channel >= viewChannels || vals.isEmpty()) return
+        if (rate > 0f) sampleRate = rate
+        synchronized(lock) {
+            val column = FloatArray(viewChannels)
+            for (v in vals) {
+                column[channel] = v
+                pushColumn(column)
+            }
+        }
+        postInvalidate()
+    }
+
     // Time-ordered ring snapshot for the spectrum worker.
     class SpectrumSnapshot(
         val channels: Array<FloatArray>,
