@@ -365,37 +365,6 @@ Every blocking operation exists in three shapes: callback listener,
 `getParam()`, `getBatteryLevel()`, `fetchDeviceInfo()`,
 `SensorController.scan()`, `parseBinToCsvAsync()`).
 
-## Streaming algorithms (SensorAlgo)
-
-`SensorAlgo` runs the SDK's streaming algorithms on a device's data batches
-(EEG relax/TBR, PPG heart rate / SpO2). Create one instance per device, then
-feed it the batches delivered by `onData`:
-
-```kotlin
-val algo = SensorAlgo()
-algo.init { ok, errorMsg -> }                 // suspend: algo.init()
-algo.setParam("EEG_SAMPLE_RATE", "250", null) // 250 / 500 / 1000
-algo.setParam("CLONE", "True", null)          // deep-copy pushed batches
-algo.setParam("EEG_REFRESH_RATE", "1", null)  // result snapshots per second
-                                              // (0 = one per update)
-
-// inside the data listener (EEG >= 2 channels, PPG >= 2 channels, and the
-// aggregated NTF_IMU batch >= 6 channels are accepted; IMU is optional):
-algo.pushSamples(arrayOf(data), "") { ok, errorMsg -> }
-// pass param "CLONE" to force a copy of that one batch
-
-algo.getResult("EEG") { result, _ -> }        // suspend: algo.getResult(key)
-```
-
-`getResult` keys: `"EEG"` / `"PPG"` for one algorithm's snapshot, or
-`"NO_HEADER"` for the bare row. The row schema is
-`STEP|TIMESTAMP|VALID|RELAX|CONCENTRATE|POSITION` (`STEP` increments once per
-algorithm update, so a repeated STEP means no new result). `reset()` restarts
-the algorithms, `hasInit()` reports the state, `destroy()` releases the
-instance. Suspend extensions (`init` / `setParam` / `getParam` /
-`pushSamples` / `getResult`) ship in `SensorCapiAsync.kt` like the rest of
-the API.
-
 ## Bin file recording and replay
 
 Every session's raw BLE capture can be exported as a `.bin` file (see
@@ -468,10 +437,7 @@ multi-device scan/connect with per-device state, three pages (Device / Bio /
 IMU), bio waveforms with a live band-pass filter picker, IMU waveforms with
 FFT spectra and a 3D quaternion cube, NTF/FILTER/sample-rate controls,
 battery display, auto reconnect, SDK debug log and bin export toggles, and
-bin replay / parse-to-CSV. On PPG devices the Bio page leads with a RELAX
-row fed by a per-device `SensorAlgo` instance (the EEG/IMU batches are pushed
-into it, results are read once per second via `EEG_REFRESH_RATE=1` and also
-logged to a CSV next to the device log). A Multi Start/Stop toggle button starts (or
+bin replay / parse-to-CSV. A Multi Start/Stop toggle button starts (or
 stops) streaming on all connected devices in sync via
 `multiStartDataNotification` / `multiStopDataNotification`, and a Multi
 Replay Bin button replays several captures at once through
