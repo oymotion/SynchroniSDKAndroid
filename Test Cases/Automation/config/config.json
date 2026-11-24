@@ -1,0 +1,32 @@
+{
+  "targetIdentity": "6C6B",
+  "devices": [
+    {"model": "Cerelax-Pro", "namePrefix": "Cerelax", "mac": "BC:93:2A:3F:85:17", "identity": "8517"},
+    {"model": "Cerelax-Pro", "namePrefix": "Cerelax", "mac": "BC:93:2A:3F:97:46", "identity": "9746"},
+    {"model": "gForceMax", "namePrefix": "gForceMax", "mac": "BC:93:2A:3F:A2:A2", "identity": "A2A2"},
+    {"model": "OB6000C", "namePrefix": "OB6000C", "mac": "78:1C:9D:E4:6C:6B", "identity": "6C6B"}
+  ],
+  "params": {
+    "scanTimeoutMs": 5000,
+    "scanRetryIntervalMs": 10000,
+    "connectTimeoutMs": 15000,
+    "readyTimeoutMs": 15000,
+    "dataTimeoutMs": 12000,
+    "initTimeoutMs": 30000,
+    "packageSampleCount": 20,
+    "powerRefreshMs": 1000,
+    "caseSettleMs": 1000,
+    "collectSeconds": 5,
+    "minSamples": 1,
+    "manualPauseSeconds": 30,
+    "perfMeasureSeconds": 10,
+    "sampleRateTolerance": 0.05,
+    "longevityStreamSeconds": 30,
+    "binPath": "/sdcard/Documents/sensorsdklog/multi_replay_pair/Cerelax-Pro_9746.bin",
+    "multiBinPaths": [
+      "/sdcard/Documents/sensorsdklog/multi_replay_pair/Cerelax-Pro_8517.bin",
+      "/sdcard/Documents/sensorsdklog/multi_replay_pair/Cerelax-Pro_9746.bin"
+    ],
+    "multiReplayEnabled": false
+  }
+}

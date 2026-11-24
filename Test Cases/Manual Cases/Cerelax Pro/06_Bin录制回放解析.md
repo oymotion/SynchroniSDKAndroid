@@ -93,12 +93,18 @@
 ### BIN-FUNC-010 multiReplayBinFile 多文件同步回放
 - **优先级**：P0
 - **测试目的**：验证 `multiReplayBinFile` 多 bin 文件按共享时钟对齐同步回放。
-- **流程与逻辑**：准备 ≥2 个不同 MAC 的有效 bin 文件；`multiReplayBinFile(file_paths, sensors=None, realtime=True)`；统计各成员 `onDataCallback` 批数与 DataType。
+- **流程与逻辑**：在 `config.json` 的 `multiBinPaths` 显式配置 ≥2 个不同 MAC 的有效 bin（首次可先跑 `BIN-FUNC-010-REC` 录制，路径会打印在用例结果里）；`multiReplayBinFile(file_paths, sensors=None, realtime=True)`；统计各成员 `onDataCallback` 批数与 DataType。
 - **预期结果**：返回列表长度等于输入文件数，每个成员返回对应 `SensorProfile`（或 None 表示该成员失败）；各成员均产生回放数据；DataType 覆盖各自 live 类型；全组以最早首条数据记录为 t=0，保留录制时的相对偏移（各成员 `startTimeStamp` 相对关系与录制时一致）。
 - **有效性说明**：多设备/多段 bin 的同步回放能力。
 - **可自动化**：auto
-- **人工介入**：无
-- **测试结果**：待测试
+- **人工介入**：无（首次需运行 `BIN-FUNC-010-REC` 录制配对 bin，并把路径回填 `multiBinPaths`）
+- **测试结果**：已实现，默认关闭（真机复现 SDK JNI 崩溃：`nativeMultiReplayBinFile` 使用失效 jstring 局部引用 → SIGABRT 杀进程；修复后可改 `config.json` 的 `multiReplayEnabled=true` 验证）
+
+> **Android 已知问题（2026-11-23 真机复现，SDK JNI bug）**：`multiReplayBinFile` 传入 2 个 bin + 2 个 MAC 时必现进程被杀。
+> logcat 关键信息：
+> `JNI DETECTED ERROR IN APPLICATION: JNI ERROR (app bug): jstring is an invalid local reference ... from long[] SensorController.nativeMultiReplayBinFile(long, String[], String[], int, int)`，
+> 随后 `Fatal signal 6 (SIGABRT)`。属 JNI 局部引用被提前释放后继续使用（与用例环境无关；已先断开同 MAC 连接态 profile 仍复现）。
+> Demo 自动化默认关闭该能力（`multiReplayEnabled=false`）记 SKIP；修复前若需保留覆盖，只能把该用例放到独立进程执行。修复后改外部 `config.json` 打开开关验证。
 
 ### BIN-BND-001 默认不导出：临时文件短暂存在后删除
 - **优先级**：P1
@@ -138,7 +144,7 @@
 - **有效性说明**：多文件回放的组控制语义。
 - **可自动化**：auto
 - **人工介入**：无
-- **测试结果**：待测试
+- **测试结果**：已实现（默认关闭：同 BIN-FUNC-010，`multiReplayEnabled=false` 时记 SKIP）
 
 ### BIN-ROB-003 回放控制重复调用幂等
 - **优先级**：P1
@@ -158,7 +164,37 @@
 - **有效性说明**：bin 是 BLE 包层地面真值，可区分"固件没发"与"SDK 没交付/没录制"，是 Impedance/IMU 等能力缺失问题的定位依据。
 - **可自动化**：auto
 - **人工介入**：无
+- **测试结果**：已实现（Demo 自动化，待真机验证）
+
+### BIN-FUNC-013 bin 回放 DataType 与 DeviceInfo ChannelCount>0 交叉验证
+- **优先级**：P1
+- **测试目的**：验证回放数据帧的 DataType 与设备能力声明一致。
+- **流程与逻辑**：录制有效 bin；`replayBinFile` 回放；遍历 `onData` 帧，按 `getDataType()` 分桶收集出现的 DataType 集合；与 `getDeviceInfo()` 中 `ChannelCount>0` 的模态集合对比。
+- **预期结果**：回放中出现的 DataType 集合 = `ChannelCount>0` 的模态集合；`ChannelCount>0` 的模态在回放中均能出现（录制时固件未发送的模态除外，见 BIN-FUNC-012）。
+- **有效性说明**：回放数据与设备能力声明一致，防止串流/错流。
+- **可自动化**：auto
+- **人工介入**：无
 - **测试结果**：待测试
+
+### BIN-FUNC-014 FLUSH_BLE_DATA 起流中刷盘
+- **优先级**：P1
+- **测试目的**：验证起流中手动刷盘。
+- **流程与逻辑**：`DEBUG_BLE_DATA_PATH=True` 起流，调用 `setParam("FLUSH_BLE_DATA","")`；重复调用；停流断开后检查日志目录是否生成新 bin 且可被 `getBinFileInfo` 解析。
+- **预期结果**：`FLUSH_BLE_DATA` 返回 OK；重复调用幂等；停流断开后生成新 bin 且可解析。
+- **有效性说明**：起流中数据及时落盘。
+- **可自动化**：auto
+- **人工介入**：无
+- **测试结果**：待测试
+
+### BIN-FUNC-015 parseBinToCsvAsync（suspend 桥）生成 CSV
+- **优先级**：P1
+- **测试目的**：验证异步解析导出（Android suspend 桥，与回调版 parseBinToCsv 同语义）。
+- **流程与逻辑**：`parseBinToCsvAsync` 解析有效 bin，检查返回结果与 CSV 内容。
+- **预期结果**：与 `parseBinToCsv` 同语义，返回 CSV 路径，文件存在且表头/行结构正确。
+- **有效性说明**：Android 异步接口覆盖。
+- **可自动化**：auto
+- **人工介入**：无
+- **测试结果**：已实现（Demo 自动化，待真机验证）
 
 ### BIN-BND-004 replayBinFile/parseBinToCsv/getBinFileInfo 空串/None/无效路径
 - **优先级**：P1
@@ -169,3 +205,13 @@
 - **可自动化**：auto
 - **人工介入**：无
 - **测试结果**：待测试
+
+### BIN-ROB-004 回放批次推送算法
+- **优先级**：P2
+- **测试目的**：验证离线场景。
+- **流程与逻辑**：用 `replayBinFile` 回放含 EEG/PPG 的 bin，把 `onData` 批次推入算法。
+- **预期结果**：结果行与实时流结构一致；`STEP` 单调递增。
+- **有效性说明**：算法不依赖实时链路特性。
+- **可自动化**：auto（需预录 bin）
+- **人工介入**：无
+- **测试结果**：已实现（Demo 自动化，待真机验证）

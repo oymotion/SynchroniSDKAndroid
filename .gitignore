@@ -9,3 +9,12 @@
 .cxx
 local.properties
 app/build/
+.kotlin/
+
+# 本地测试产物 / 诊断数据（不提交）
+/_diag_pull/
+/sensor_logs_*/
+/.screenshots/
+/app/libs/_aar_tmp/
+/.trae/
+/AGENTS.md

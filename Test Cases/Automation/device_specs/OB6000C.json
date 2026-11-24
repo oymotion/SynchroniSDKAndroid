@@ -1,0 +1,39 @@
+{
+  "model": "OB6000C",
+  "type": "脑电传感器（32 通道 EEG + 13 通道 IMU[acc3+gyro3+euler3+quat4] + 32 通道电极接触检测）",
+  "namePrefix": "OB6000C",
+  "streams": {
+    "NTF_EMG": {"supported": false, "channels": 0},
+    "NTF_GEST": {"supported": false, "channels": 0},
+    "NTF_GFORCE_ACC": {"supported": true, "channels": 3},
+    "NTF_GFORCE_GYRO": {"supported": true, "channels": 3},
+    "NTF_GFORCE_EULER": {"supported": true, "channels": 3},
+    "NTF_GFORCE_QUAT": {"supported": true, "channels": 4},
+    "NTF_IMU": {"supported": true, "channels": 13},
+    "NTF_MAG": {"supported": false, "channels": 0},
+    "NTF_ANGLE_DATA": {"supported": false, "channels": 0},
+    "NTF_IMPEDANCE": {"supported": true, "channels": 32},
+    "NTF_EEG": {"supported": true, "channels": 32},
+    "NTF_ECG": {"supported": false, "channels": 0},
+    "NTF_BRTH": {"supported": false, "channels": 0},
+    "NTF_PPG": {"supported": false, "channels": 0},
+    "NTF_SPO2": {"supported": false, "channels": 0}
+  },
+  "imuSubChannels": {
+    "AccChannelCount": 3,
+    "GyroChannelCount": 3,
+    "EulerChannelCount": 3,
+    "QuatChannelCount": 4
+  },
+  "filters": {
+    "FILTER_50HZ": true,
+    "FILTER_60HZ": true,
+    "FILTER_HPF": true,
+    "FILTER_LPF": true
+  },
+  "sampleRates": {
+    "EEG_SAMPLE_RATE": {"rates": ["250"], "default": "250", "stream": "NTF_EEG", "settable": true, "coStream": null},
+    "IMU_SAMPLE_RATE": {"rates": ["50"], "default": "50", "stream": "NTF_IMU", "settable": true, "coStream": "NTF_EEG"},
+    "IMPEDANCE": {"rates": ["1"], "default": "1", "stream": "NTF_IMPEDANCE", "settable": false, "coStream": "NTF_EEG"}
+  }
+}

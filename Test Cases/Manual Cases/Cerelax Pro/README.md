@@ -11,7 +11,7 @@
 | 类型归属 | 头环 / EEG 设备 |
 | 核心能力 | NTF_EEG（2 通道脑电）、NTF_PPG、NTF_IMU、NTF_IMPEDANCE（电极接触检测） |
 | 采样率 | EEG `1000\|500\|250`（默认 `1000`）；IMU `50\|100\|200`；PPG `50\|100\|200\|400` |
-| SDK 版本 | 1.3.8（Android AAR） |
+| SDK 版本 | 1.4.6（Android AAR） |
 
 ## 已固化能力（单一事实来源：`device_specs/cerelax_pro.py`，851C 实测）
 
@@ -43,7 +43,7 @@
 
 ## 环境与前置条件
 
-- SDK 为 Android AAR `app/libs/sensorcapi-release.aar`，`getVersion()` 实测 1.3.8；构建/真机测试见仓库根 `AGENTS.md` §五。
+- SDK 为 Android AAR `app/libs/sensorcapi-release.aar`，`getVersion()` 实测 1.4.6；构建/真机测试见仓库根 `AGENTS.md` §五。
 - Android 设备/模拟器蓝牙开启，测试设备上电、在扫描范围内。
 - 每个测试结束调用 `SensorController.terminate()`（静态方法，释放资源）。
 - 连接/起流/停流等操作之间留 ≥100ms 间隔。
@@ -120,7 +120,7 @@
 | SensorController | getConnectedSensors/Devices | CTRL-FUNC-009 | — |
 | SensorController | multiStart/multiStop | MULTI-FUNC-001/002 | MULTI-BND-001、MULTI-ROB-001 |
 | SensorController | replayBinFile/pause/resume/stop | BIN-FUNC-004/006 | BIN-FUNC-007、BIN-ROB-003 |
-| SensorController | multiReplayBinFile | BIN-FUNC-010 | BIN-BND-002、BIN-ROB-002 |
+| SensorController | multiReplayBinFile | BIN-FUNC-010（前置 BIN-FUNC-010-REC 配对录制） | BIN-BND-002、MULTI-BND-003、BIN-ROB-002 |
 | SensorController | parseBinToCsv/getBinFileInfo | BIN-FUNC-002/008 | BIN-FUNC-003、BIN-BND-004 |
 | SensorController | terminate | CTRL-FUNC-013 | — |
 | SensorProfile | connect/disconnect | DEV-SM-001/004 | DEV-SM-002、DEV-SM-015/016 |
@@ -129,9 +129,18 @@
 | SensorProfile | setParam/getParam | PARAM-FUNC-001/002/004/006/012/013 | PARAM-FUNC-005/008、PARAM-BND-001/002/003 |
 | SensorProfile | getBatteryLevel/onPowerChanged | BATT-FUNC-001/002 | BATT-FUNC-004（失效模式） |
 | SensorProfile | async 变体 | ASYNC-FUNC-001~012 | ASYNC-FUNC-010（混用限制） |
-| SensorData | getSampleRate/getChannelCount 等 | DATA-FUNC-006 | DATA-PERF-003（标称值校验） |
+| SensorData | getSampleRate/getChannelCount 等 | DATA-FUNC-006 | DATA-PERF-003（标称值校验）、DATA-BND-004/005/007（越界访问器） |
 | SensorData | clone | DATA-FUNC-012 | — |
+| SensorAlgo | init/hasInit/destroy | ASYNC-FUNC-013/014、MISC-FUNC-011 | MISC-BND-001、ASYNC-FUNC-015 |
+| SensorAlgo | setParam/getParam（EEG_SAMPLE_RATE/CLONE/EEG_REFRESH_RATE） | PARAM-FUNC-014/015/016 | PARAM-BND-004/005/006 |
+| SensorAlgo | pushSamples/getResult | DATA-FUNC-017/018/019/020 | MISC-BND-002/003、DATA-ROB-003 |
+| SensorAlgo | reset | DATA-FUNC-021 | — |
+| SensorAlgo | 真实流集成/并发/性能 | DATA-FUNC-022/023、DATA-ROB-004 | DATA-PERF-004 |
 
+> SensorAlgo 章节（`DATA-FUNC-017~023`、`DATA-ROB-003/004`、`DATA-PERF-004`、`PARAM-FUNC-014~016`、
+> `PARAM-BND-004~006`、`ASYNC-FUNC-013~015`、`MISC-FUNC-011`、`MISC-BND-001~003`）已在 Demo 侧
+> `AndroidAutomationTests/` 落地，状态标记为「已实现（Demo 自动化，待真机验证）」。
+>
 > 未映射到用例的接口显式标"未覆盖"，待 README 定案后补齐。
 
 ## 超时 / 轮询 / 重试约定（§四）

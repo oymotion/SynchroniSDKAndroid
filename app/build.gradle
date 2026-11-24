@@ -42,6 +42,129 @@ android {
     kotlinOptions {
         jvmTarget = '17'
     }
+
+    // 自动化代码目录划分（对齐 Python 仓库 Test Cases/Automation/）：
+    //   - AndroidAutomationTests/             demo 侧自动化
+    //   - Test Cases/Automation/core/         配置/spec/公共辅助（纯 Kotlin，main 与 androidTest 共用）
+    //   - Test Cases/Automation/Generalized/  章节目录用例（androidTest）
+    //   - Test Cases/Automation/probes/       设备能力探针（androidTest）
+    // main 与 androidTest 的 srcDirs 互不重叠，避免 core 类被重复编译。
+    def automationRoot = "$rootDir/Test Cases/Automation"
+    sourceSets {
+        main.java.srcDirs += ["$rootDir/AndroidAutomationTests", "$automationRoot/core"]
+        androidTest.java.srcDirs += ["$automationRoot/Generalized", "$automationRoot/probes"]
+    }
+
+    // 把默认 config/spec JSON 打进 assets（automation/config.json + automation/device_specs/*.json），
+    // 作为设备端外部 JSON 缺失时的内置兜底。构建产物目录不污染源码树。
+    sourceSets.main.assets.srcDir(layout.buildDirectory.dir("generated/automationAssets"))
+}
+
+// 同步默认配置与设备规格到 assets 生成目录。
+def automationSrcDir = "$rootDir/Test Cases/Automation"
+tasks.register("syncAutomationAssets", Copy) {
+    into layout.buildDirectory.dir("generated/automationAssets/automation")
+    from("$automationSrcDir/config/config.json")
+    from("$automationSrcDir/device_specs") { into "device_specs" }
+}
+
+tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn "syncAutomationAssets"
+}
+
+// 设备能力探针闭环：跑设备端 ProbeDeviceTest -> adb pull 结果 -> 生成 device_specs/<model>.json
+// -> 幂等更新 config/config.json -> push 回设备。用法：
+//   .\gradlew.bat probeDevice -PprobeIdentity=850B
+//   .\gradlew.bat probeDevice -PprobeIndex=0 -PstreamSeconds=5
+def probeIdentity = project.findProperty("probeIdentity") ?: ""
+def probeIndex = project.findProperty("probeIndex") ?: ""
+def probeStreamSeconds = project.findProperty("streamSeconds") ?: "5"
+def probePullDir = layout.buildDirectory.dir("automation-probes").get().asFile
+def remoteAutomationDir = "/sdcard/Android/data/com.oymotion.sensorcapiktdemo/files/automation"
+
+tasks.register("probeDevice") {
+    group = "verification"
+    description = "扫描并探测目标设备能力，生成 Test Cases/Automation/device_specs/<model>.json 并回写 config.json"
+    dependsOn "assembleDebug", "assembleDebugAndroidTest"
+
+    doLast {
+        def execOps = project.services.get(org.gradle.process.ExecOperations)
+        def adbPath = android.adbExecutable.absolutePath
+
+        def devicesOut = new ByteArrayOutputStream()
+        execOps.exec { exec ->
+            exec.commandLine adbPath, "devices"
+            exec.standardOutput = devicesOut
+        }
+        def deviceOnline = devicesOut.toString().readLines().drop(1).any { line -> line.contains("\tdevice") }
+        if (!deviceOnline) {
+            throw new GradleException("未检测到已连接设备：请先 adb devices 确认设备在线")
+        }
+
+        def runnerArgs = ["-Pandroid.testInstrumentationRunnerArguments.class=com.oymotion.sensorcapiktdemo.automation.probes.ProbeDeviceTest"]
+        if (probeIdentity) {
+            runnerArgs.add("-Pandroid.testInstrumentationRunnerArguments.probeIdentity=" + probeIdentity)
+        }
+        if (probeIndex) {
+            runnerArgs.add("-Pandroid.testInstrumentationRunnerArguments.probeIndex=" + probeIndex)
+        }
+        runnerArgs.add("-Pandroid.testInstrumentationRunnerArguments.streamSeconds=" + probeStreamSeconds)
+
+        def gradlewPath = new File(rootDir, isWindows() ? "gradlew.bat" : "gradlew").absolutePath
+        execOps.exec { exec ->
+            exec.workingDir rootDir
+            exec.commandLine([gradlewPath, ":app:connectedDebugAndroidTest", "--console=plain"] + runnerArgs)
+        }
+
+        probePullDir.mkdirs()
+        execOps.exec { exec ->
+            exec.workingDir rootDir
+            exec.commandLine adbPath, "pull", remoteAutomationDir + "/probes", probePullDir.absolutePath
+        }
+
+        def probeFile = new File(probePullDir, "probes/latest_probe.json")
+        if (!probeFile.isFile) {
+            throw new GradleException("未找到探针结果：" + probeFile.absolutePath)
+        }
+        def probeData = new groovy.json.JsonSlurper().parse(probeFile)
+        def modelName = probeData.model
+
+        def specDir = new File(automationSrcDir, "device_specs")
+        specDir.mkdirs()
+        def specFile = new File(specDir, modelName + ".json")
+        specFile.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(probeData.spec))
+        logger.lifecycle("已生成设备规格：" + specFile.absolutePath)
+
+        def configFile = new File(automationSrcDir, "config/config.json")
+        def configData = new groovy.json.JsonSlurper().parse(configFile)
+        def existingDevices = configData.devices
+        if (existingDevices == null) {
+            existingDevices = []
+        }
+        def keptDevices = existingDevices.findAll { item -> item.identity != probeData.identity }
+        keptDevices.add([
+            model: modelName,
+            namePrefix: probeData.namePrefix,
+            mac: probeData.mac,
+            identity: probeData.identity,
+        ])
+        configData.devices = keptDevices
+        if (!configData.targetIdentity) {
+            configData.targetIdentity = probeData.identity
+        }
+        configFile.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(configData))
+        logger.lifecycle("已更新配置：" + configFile.absolutePath)
+
+        execOps.exec { exec -> exec.commandLine adbPath, "shell", "mkdir", "-p", remoteAutomationDir + "/device_specs" }
+        execOps.exec { exec -> exec.commandLine adbPath, "push", configFile.absolutePath, remoteAutomationDir + "/config.json" }
+        execOps.exec { exec -> exec.commandLine adbPath, "push", specFile.absolutePath, remoteAutomationDir + "/device_specs/" + modelName + ".json" }
+
+        logger.lifecycle("探针闭环完成。请复核 " + specFile.name + " 中的 TODO 项（如采样率档位、滤波开关）。")
+    }
+}
+
+def isWindows() {
+    return System.getProperty("os.name").toLowerCase().contains("windows")
 }
 
 dependencies {
