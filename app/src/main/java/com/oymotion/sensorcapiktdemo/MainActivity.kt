@@ -62,6 +62,7 @@ private const val FFT_UPDATE_INTERVAL_MS = 200L
 
 // File picker request code.
 private const val REQUEST_PICK_REPLAY_FILE = 42
+private const val REQUEST_PICK_MULTI_REPLAY = 43
 
 // The demo's own version, shown in the title.
 private const val DEMO_VERSION = "0.1.50"
@@ -752,7 +753,7 @@ class MainActivity : Activity() {
         }
         multiReplayBtn = Button(this).apply {
             text = "Multi Replay Bin"
-            setOnClickListener { onMultiReplay() }
+            setOnClickListener { pickMultiReplayFiles() }
         }
         pauseReplayBtn = Button(this).apply {
             text = "Pause Replay"
@@ -2063,15 +2064,41 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != REQUEST_PICK_REPLAY_FILE || resultCode != RESULT_OK) return
-        val uri = data?.data ?: return
-        val path = importReplayFile(uri)
-        if (path == null) {
-            setStatus("Unsupported file: $uri")
-            return
+        if (resultCode != RESULT_OK || data == null) return
+        when (requestCode) {
+            REQUEST_PICK_REPLAY_FILE -> {
+                val uri = data.data ?: return
+                val path = importReplayFile(uri)
+                if (path == null) {
+                    setStatus("Unsupported file: $uri")
+                    return
+                }
+                replayPathEdit.setText(path)
+                startReplay(path, true)
+            }
+            REQUEST_PICK_MULTI_REPLAY -> {
+                val uris = ArrayList<Uri>()
+                data.data?.let { uris.add(it) }
+                data.clipData?.let { clip ->
+                    for (i in 0 until clip.itemCount) clip.getItemAt(i).uri?.let { uris.add(it) }
+                }
+                if (uris.size < 2) {
+                    setStatus("Multi replay needs at least 2 bin files")
+                    return
+                }
+                val paths = ArrayList<String>()
+                for (uri in uris) {
+                    val path = importReplayFile(uri)
+                    if (path == null) {
+                        setStatus("Unsupported file: $uri")
+                        return
+                    }
+                    paths.add(path)
+                }
+                replayPathEdit.setText(paths.joinToString(";"))
+                startGroupReplay(paths, true)
+            }
         }
-        replayPathEdit.setText(path)
-        startReplay(path, true)
     }
 
     // "primary:Download/x.bin" -> "/sdcard/Download/x.bin" when reachable,
@@ -2271,15 +2298,22 @@ class MainActivity : Activity() {
 
     // ---- bin replay -----------------------------------------------------------
 
-    // Multi Replay Bin button: the path field is a ';'-separated path list.
-    private fun onMultiReplay() {
-        val paths = replayPathEdit.text.toString()
-            .split(';').map { it.trim() }.filter { it.isNotEmpty() }
-        if (paths.size < 2) {
-            setStatus("Multi replay needs multiple ';'-separated bin paths")
-            return
+    // Multi Replay Bin button: pick multiple bin files via the system picker.
+    private fun pickMultiReplayFiles() {
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(
+                Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "*/*"
+                    putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    initialReplayDirUri()?.let {
+                        putExtra(DocumentsContract.EXTRA_INITIAL_URI, it)
+                    }
+                }, REQUEST_PICK_MULTI_REPLAY)
+        } catch (e: Exception) {
+            setStatus("File picker unavailable: ${e.message}")
         }
-        startGroupReplay(paths, true)
     }
 
     // Starts a realtime (or full-speed) bin replay. The replay profile gets
