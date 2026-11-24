@@ -37,8 +37,7 @@
 
 ## 3. 设备能力探针
 
-- 新增探针：`probes/ProbeDeviceTest.kt`（能力探测）、`FilterProbeTest.kt`（滤波读写诊断）、
-  `Sm014DiagTest.kt`（诊断）。
+- 新增探针：`probes/ProbeDeviceTest.kt`（能力探测）、`FilterProbeTest.kt`（滤波读写诊断）。
 - `app/build.gradle` 新增 `probeDevice` Gradle 任务，实现「探测 → adb pull 结果 →
   生成 `device_specs/<model>.json` → 幂等更新 `config.json` → push 回设备」的闭环：
 
