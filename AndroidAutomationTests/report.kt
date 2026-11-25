@@ -23,8 +23,16 @@ object AutomationReport {
         val sharedPaths: List<String> = emptyList(),
     )
 
-    fun write(context: Context, results: Collection<TestResult>): Output {
-        val sorted = results.sortedBy { it.id }
+    /**
+     * @param cases 全量用例；提供时按「自动 + 半自动」补全未执行项为 PENDING（纯人工不入报告），
+     *              不提供时只导出已执行结果。
+     */
+    fun write(
+        context: Context,
+        results: Collection<TestResult>,
+        cases: List<TestCase> = emptyList(),
+    ): Output {
+        val sorted = reportRows(results, cases).sortedBy { it.id }
         val summary = Verdict.values().joinToString(" ") { v ->
             "${v.name.lowercase()}=${sorted.count { it.verdict == v }}"
         }
@@ -83,6 +91,31 @@ object AutomationReport {
             "total=${sorted.size} $summary",
             sharedPaths,
         )
+    }
+
+    /**
+     * 报告行：全量用例中自动 + 半自动每条一行（未执行记 PENDING），纯人工剔除；
+     * 不在用例目录里的已执行结果（旧版本/临时用例）仍保留。
+     */
+    private fun reportRows(results: Collection<TestResult>, cases: List<TestCase>): List<TestResult> {
+        if (cases.isEmpty()) return results.toList()
+        val executed = results.associateBy { it.id }
+        val spec = runCatching { TestConfig.targetSpec() }.getOrNull()
+        // 能力不适用（spec 不支持）的用例不进报告；自动/半自动/人工都保留，未执行记 PENDING 待人工确认。
+        val applicable = cases.filter { case ->
+            spec == null || case.requires.all { spec.supports(it) }
+        }
+        val catalogIds = applicable.mapTo(HashSet()) { it.id }
+        val rows = applicable.map { case ->
+            executed[case.id] ?: TestResult(
+                case.id, case.title, case.chapter, case.priority, case.mode, Verdict.PENDING,
+                case.steps.joinToString("；"),
+            )
+        }.toMutableList()
+        rows += results.filter {
+            it.id !in catalogIds && !it.detail.startsWith("当前设备 spec 不支持")
+        }
+        return rows
     }
 
     /** 当前目标设备信息（型号 / identity / MAC）；配置不可用时返回空串，不影响报告生成。 */

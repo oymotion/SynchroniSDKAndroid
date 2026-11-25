@@ -42,6 +42,9 @@ Test Cases/Automation/
 ├── probes/
 │   ├── ProbeDeviceTest.kt             # 设备能力探针（配合 gradlew probeDevice）
 │   └── FilterProbeTest.kt             # FILTER_* 读写诊断探针（只打印不断言）
+├── known_issues.json                  # 失败用例 → 问题编号映射（HTML 报告用）
+├── make_html_report.py                # report_*.json → reports/report_<model>.html
+├── reports/report_<model>.html        # 已生成的 HTML 报告（按型号覆盖）
 └── Generalized/                       # 通用用例（按章节，与型号无关）
     ├── 00_Smoke/ 00_Longevity/ 00_Stress/
     ├── 01_Control_Scan … 07_Battery_Log
@@ -57,11 +60,12 @@ Test Cases/Automation/
 
 ```json
 {
-  "targetIdentity": "9746",
+  "targetIdentity": "9AA0",
   "devices": [
     {"model": "Cerelax-Pro", "namePrefix": "Cerelax", "mac": "BC:93:2A:3F:85:17", "identity": "8517"},
     {"model": "Cerelax-Pro", "namePrefix": "Cerelax", "mac": "BC:93:2A:3F:97:46", "identity": "9746"},
     {"model": "gForceMax",  "namePrefix": "gForceMax", "mac": "BC:93:2A:3F:9A:A7", "identity": "9AA7"},
+    {"model": "gForceMax",  "namePrefix": "gForceMax", "mac": "BC:93:2A:3F:9A:A0", "identity": "9AA0"},
     {"model": "OB6000C",    "namePrefix": "OB6000C",  "mac": "78:1C:9D:E4:6C:6B", "identity": "6C6B"}
   ]
 }
@@ -71,7 +75,8 @@ Test Cases/Automation/
 |---|---|
 | Cerelax-Pro（8517） | `"8517"` |
 | Cerelax-Pro（9746） | `"9746"` |
-| gForceMax | `"9AA7"` |
+| gForceMax（9AA7） | `"9AA7"` |
+| gForceMax（9AA0） | `"9AA0"` |
 | OB6000C | `"6C6B"` |
 
 改完跑测试即可（见 §6）。目标设备匹配统一走 `TestConfig.matchesTarget`：
@@ -100,6 +105,7 @@ Test Cases/Automation/
   "params": {                          // 通用测试参数，可覆盖内置默认
     "scanTimeoutMs": 5000,
     "scanRetryIntervalMs": 10000,
+    "connectTimeoutMs": 15000,
     "readyTimeoutMs": 15000,
     "dataTimeoutMs": 12000,
     "initTimeoutMs": 30000,
@@ -112,7 +118,9 @@ Test Cases/Automation/
     "perfMeasureSeconds": 10,
     "sampleRateTolerance": 0.05,
     "longevityStreamSeconds": 30,
-    "binPath": "..."                    // bin 回放/解析用的本地 bin 路径
+    "binPath": "...",                   // bin 回放/解析用的本地 bin 路径
+    "multiBinPaths": ["...", "..."],    // 多 bin 同步回放的文件列表
+    "multiReplayEnabled": false         // 是否启用多 bin 同步回放
   }
 }
 ```
@@ -128,6 +136,7 @@ Test Cases/Automation/
   "model": "Cerelax-Pro",
   "type": "脑电头环（2 通道 EEG + 2 通道 PPG + 6 轴 IMU 聚合 + 电极接触检测）",
   "namePrefix": "Cerelax",
+  "relax": true,                        // 是否提供 SensorAlgo 放松指数（缺省 false）
   "streams": {                          // 数据流能力
     "NTF_EEG": {"supported": true, "channels": 2},
     "NTF_PPG": {"supported": true, "channels": 2},
@@ -170,6 +179,9 @@ Test Cases/Automation/
   可选 `subStreams` 表示该采样率同时作用于哪些子流（如 gForceMax 的 `IMU_SAMPLE_RATE`
   同时作用于 `NTF_ACC/NTF_GYRO/NTF_EULER_DATA/NTF_QUATERNION`）。
 - **通道数**：用例用 `spec.channels(key)` 断言，不写死数值。
+- **IMU 子流**：`streams` 还含 `NTF_GFORCE_ACC/NTF_GFORCE_GYRO/NTF_GFORCE_EULER/NTF_GFORCE_QUAT`
+  子流项（Cerelax 仅 ACC/GYRO 有独立开关，gForceMax 四项全有），供 `CerelaxSpec` 校验聚合流拆分。
+- **放松指数**：`relax == true` 表示设备提供 SensorAlgo 的 RELAX 能力（缺省 false）。
 - **滤波**：spec 的 `filters` 只声明「支持哪些 FILTER_* 键」，实际可切换键以设备
   `getParam("FILTER")` 返回的聚合列表为准（两者不一致时用 `FilterProbeTest` 诊断）。
 
@@ -286,6 +298,22 @@ JSON 结构：`summary` + `results` 数组，每条用例一个对象：
 
 > `detail` 只存结论，**详细执行日志走 logcat，不进报告**（见 §11）。
 
+### 10.1 HTML 报告
+
+把 Demo 导出的 `report_*.json` 转成可读的 HTML 报告（每型号一份，文件名不含时间戳，覆盖上一版）：
+
+```powershell
+python "Test Cases/Automation/make_html_report.py" reports/report_gForceMax_20261125_122752.json
+python "Test Cases/Automation/make_html_report.py" reports/*.json --out reports
+```
+
+- 输出：`reports/report_<model>.html`，含「总用例 / 通过 / 失败 / 跳过 / 待人工 / 通过率（已执行）」概览、
+  缺陷清单、按章节用例明细。
+- 自动/半自动/人工三类都进报告并标注；spec 不支持（`detail` 以「当前设备 spec 不支持」开头）的用例不进报告。
+- 通过率 = 通过 / 已执行（通过 + 失败 + 跳过），`PENDING`（待人工）不计入分母。
+- 失败用例若在 [known_issues.json](known_issues.json) 登记问题编号，报告显示「失败 · 问题 NNNN」并进缺陷清单；
+  键支持「用例ID」全局生效与「型号/用例ID」机型优先，`_` 开头的键忽略。
+
 ---
 
 ## 11. 日志与排查
@@ -318,7 +346,7 @@ instrumentation 运行没有报告，直接看 Gradle 测试结果 + `adb logcat
 | 层 | 规模 | 说明 |
 |---|---:|---|
 | Demo 自动化（`AndroidAutomationTests/`） | 188 条 | 覆盖全部可自动化手工用例；仅 `HW-MAN-*` 人工硬件项无自动化 |
-| Instrumentation（`Generalized/`） | 144 个方法 | Demo 的子集；其中 22 个 `@Ignore` |
+| Instrumentation（`Generalized/`） | 147 个章节用例方法 | 另有 4 个 smoke/longevity/stress 总测；Demo 的子集，其中 16 个 `@Ignore` |
 | Cerelax Pro 手工 | 194 条 | `Test Cases/Manual Cases/Cerelax Pro/` |
 | gForceMax 手工 | 177 条 | `Test Cases/Manual Cases/gForceMax/`，已按 spec 排除不适用能力 |
 | OB6000C 手工 | 186 条 | `Test Cases/Manual Cases/OB6000C/`，已按 spec 排除不适用能力 |

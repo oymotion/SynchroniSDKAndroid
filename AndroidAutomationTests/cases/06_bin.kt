@@ -449,6 +449,8 @@ val binCases = run {
         // 把打印出的路径回填 config.json 的 multiBinPaths 后即可跑 BIN-FUNC-010。
         auto("BIN-FUNC-010-REC", "多设备配对录制 bin（供多文件回放使用）", chapter, Priority.P1,
             300_000) {
+            // LOG_PATH 必须在设备 connect/init 之前指向录制目录，否则 bin 落到用例诊断目录，findBins 查不到。
+            val dir = prepareBinLogDir()
             val ready = ArrayList<SensorProfile>()
             for (p in runCatching { requireKnownDevices() }.getOrDefault(emptyList())) {
                 if (ready.size == 2) break
@@ -460,7 +462,6 @@ val binCases = run {
             }
             if (ready.size < 2) skip("需要 ≥2 台可连接的就绪设备（当前 ${ready.size} 台）")
 
-            val dir = prepareBinLogDir()
             val before = findBins(dir).map { it.absolutePath }.toSet()
             try {
                 val (started, errors) = controller.multiStartDataNotification(ready, 30_000, 5, 3)

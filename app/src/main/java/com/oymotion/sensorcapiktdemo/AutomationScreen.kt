@@ -365,8 +365,12 @@ class AutomationScreen(
                 connected.forEach { profile -> runCatching { profile.disconnect() } }
                 connected.size
             }
+            val previousTargets = TestConfig.targetIdentities
             TestConfig.setTargetIdentity(identity)
             val persisted = withContext(Dispatchers.IO) { TestConfig.persistTargetIdentity(identity) }
+            // 换型号意味着新一轮跑批：清空上一型号的结果，避免导出时串数据。
+            val switched = previousTargets != TestConfig.targetIdentities
+            if (switched) results.clear()
             activeSpec = null
             refreshActiveSpec()
             refresh()
@@ -374,7 +378,8 @@ class AutomationScreen(
             if (disconnected > 0) appendLog("切换目标前已断开 $disconnected 台旧连接")
             appendLog(
                 "目标设备已切换为 ${TestConfig.targetIdentities.joinToString(",")}" +
-                    "（写回外部 config.json：${if (persisted) "成功" else "失败"}）"
+                    "（写回外部 config.json：${if (persisted) "成功" else "失败"}）" +
+                    if (switched) "，上一型号结果已清空" else ""
             )
         }
     }
@@ -543,7 +548,9 @@ class AutomationScreen(
             return
         }
         scope.launch {
-            val output = withContext(Dispatchers.IO) { AutomationReport.write(activity, results.values) }
+            val output = withContext(Dispatchers.IO) {
+                AutomationReport.write(activity, results.values, allCases)
+            }
             appendLog("报告: ${output.jsonPath}\n文本: ${output.txtPath}\n${output.summary}")
             if (output.sharedPaths.isNotEmpty()) {
                 appendLog("已复制到公共下载目录:\n${output.sharedPaths.joinToString("\n")}")

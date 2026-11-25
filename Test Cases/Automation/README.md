@@ -17,6 +17,9 @@ Test Cases/Automation/
 ├── probes/
 │   ├── ProbeDeviceTest.kt             # 设备能力探针（配合 gradlew probeDevice）
 │   └── FilterProbeTest.kt             # FILTER_* 读写诊断探针（只打印不断言）
+├── known_issues.json                  # 失败用例 → 问题编号映射（HTML 报告用）
+├── make_html_report.py                # report_*.json → reports/report_<model>.html
+├── reports/report_<model>.html        # 已生成的 HTML 报告（按型号覆盖）
 └── Generalized/
     ├── 00_Smoke/ 00_Longevity/ 00_Stress/
     └── 01_Control_Scan … 07_Battery_Log、09_Async_Interface、10_Base_Interface_and_Boundary
@@ -35,7 +38,7 @@ Test Cases/Automation/
 | 层 | 规模 | 说明 |
 |---|---:|---|
 | Demo 自动化（`AndroidAutomationTests/`） | 188 条 | 覆盖全部可自动化手工用例；仅人工硬件项 `HW-MAN-*` 无自动化（Cerelax 6 / gForceMax 5 / OB6000C 3） |
-| Instrumentation（`Generalized/`） | 144 个方法 | Demo 的子集；其中 22 个 `@Ignore`（Android 不适用/需人工/未实现占位） |
+| Instrumentation（`Generalized/`） | 147 个章节用例方法 | 另有 4 个 smoke/longevity/stress 总测；Demo 的子集，其中 16 个 `@Ignore`（Android 不适用/需人工/未实现占位） |
 | Cerelax Pro 手工 | 194 条 | 01~10 章，含 `SYS-ROB-*` |
 | gForceMax 手工 | 177 条 | 按 spec 过滤；EEG/PPG/SPO2 等不适用用例未写入 |
 | OB6000C 手工 | 186 条 | 按 spec 过滤；PPG/SPO2 等不适用用例未写入 |
@@ -43,6 +46,8 @@ Test Cases/Automation/
 - Instrumentation 当前未覆盖约 50 条 Cerelax 非人工用例（SensorAlgo 整段、`SYS-ROB-*`、部分 `MISC/BIN/MULTI/PARAM` 边界），Demo 侧是当前最全实现。
 - 手工用例为能力覆盖的权威规格：`Test Cases/Manual Cases/{Cerelax Pro,gForceMax,OB6000C}/`。
 - 两套自动化入口的 ID 前缀/方法名映射一致；`@Ignore` 需按原因区分“Android 不适用”与“未实现”。
+- HTML 报告：`make_html_report.py` 把 Demo 导出的 `report_*.json` 转为 `reports/report_<model>.html`，
+  失败用例按 `known_issues.json`（`型号/用例ID` 优先于全局 `用例ID`）标注问题编号。
 
 ## 配置与规格加载优先级
 
@@ -60,11 +65,12 @@ Test Cases/Automation/
 
 ```json
 {
-  "targetIdentity": "9746",
+  "targetIdentity": "9AA0",
   "devices": [
     {"model": "Cerelax-Pro", "namePrefix": "Cerelax", "mac": "BC:93:2A:3F:85:17", "identity": "8517"},
     {"model": "Cerelax-Pro", "namePrefix": "Cerelax", "mac": "BC:93:2A:3F:97:46", "identity": "9746"},
     {"model": "gForceMax", "namePrefix": "gForceMax", "mac": "BC:93:2A:3F:9A:A7", "identity": "9AA7"},
+    {"model": "gForceMax", "namePrefix": "gForceMax", "mac": "BC:93:2A:3F:9A:A0", "identity": "9AA0"},
     {"model": "OB6000C", "namePrefix": "OB6000C", "mac": "78:1C:9D:E4:6C:6B", "identity": "6C6B"}
   ],
   "params": {"scanTimeoutMs": 5000, "readyTimeoutMs": 15000, "binPath": "..."}
