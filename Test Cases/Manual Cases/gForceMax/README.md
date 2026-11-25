@@ -7,7 +7,7 @@
 | 项 | 内容 |
 |----|------|
 | 设备型号 | gForceMax（EMG 腕带） |
-| 广播名前缀 | `gForceMax`（形如 `gForceMax(A2A2)`） |
+| 广播名前缀 | `gForceMax`（形如 `gForceMax(9AA7)`） |
 | 类型归属 | OYM 命名设备 / 传统 OYMotion 设备（非"新 EMG 设备"） |
 | 核心能力 | NTF_EMG（8 通道肌电）、NTF_GEST（手势）、NTF_IMU（13 通道）、NTF_IMPEDANCE（8 通道电极接触检测） |
 | 采样率 | EMG `500\|1000`（默认 `1000`）；IMU `50\|100\|200`（默认 `50`，以设备回读为准）；IMPEDANCE 固定约 1Hz |
@@ -19,9 +19,9 @@
 |----|-----|
 | model | `gForceMax` |
 | namePrefix | `gForceMax` |
-| MAC | `BC:93:2A:3F:A2:A2` |
-| identity | `A2A2` |
-| targetIdentity 默认 | `8517`（Cerelax-Pro）；**测 gForceMax 时改为 `A2A2`** |
+| MAC | `BC:93:2A:3F:9A:A7` |
+| identity | `9AA7` |
+| targetIdentity 默认 | `9746`（Cerelax-Pro）；**测 gForceMax 时改为 `9AA7`** |
 
 > 设备/身份匹配统一走 `TestConfig.matchesTarget()`（MAC 精确 > 广播名后四位 identity），不硬编码 MAC。
 > 已知现象：部分固件把 `DeviceInfo.modelName` 上报为 `gForceUltra`，这是已知差异；**spec 仍按
@@ -67,7 +67,7 @@
 - SDK 为 Android AAR `app/libs/sensorcapi-release.aar`，`getVersion()` 实测 1.4.6；构建/真机测试见仓库根 `AGENTS.md` §五。
 - 初始化：`SensorController.getInstance()` → `controller.registerBleBridge(context)`，使用 **Android 系统原生 BLE**（无 dongle、无后端切换）。
 - 权限：`BLUETOOTH_SCAN` / `BLUETOOTH_CONNECT`（Android 12+），运行时授予；宿主蓝牙开启。
-- 设备 MAC / identity 写入 `Test Cases/Automation/config/config.json`；测 gForceMax 时把 `targetIdentity` 设为 `A2A2`。
+- 设备 MAC / identity 写入 `Test Cases/Automation/config/config.json`；测 gForceMax 时把 `targetIdentity` 设为 `9AA7`。
 - 设备上电、在扫描范围内、广播名以 `gForceMax` 开头。
 - 每个测试结束调用静态方法 `SensorController.terminate()`；异常路径也需调用。
 - 连接/起流/停流等操作之间留 ≥100ms 间隔。
@@ -84,11 +84,11 @@
 | [05_多设备同步.md](./05_多设备同步.md) | `MULTI-*`：同步起流/停流（需 ≥2 台） |
 | [06_Bin录制回放解析.md](./06_Bin录制回放解析.md) | `BIN-*`：录制/回放/CSV |
 | [07_电量日志调试.md](./07_电量日志调试.md) | `BATT-*` / `LOG-*` |
-| [08_人工硬件用例.md](./08_人工硬件用例.md) | `HW-MAN-*`：人工/仪器用例 |
+| [08_人工硬件用例.md](./08_人工硬件用例.md) | `HW-MAN-*`：人工/仪器用例；`SYS-ROB-*`：系统级异常场景 |
 | [09_异步接口.md](./09_异步接口.md) | `ASYNC-*`：suspend 与 CompletableFuture 变体 |
 | [10_底层接口与边界补充.md](./10_底层接口与边界补充.md) | `MISC-*`：DeviceInfo/INVALID/不适用 Android 接口 |
 
-用例总数 **122** 条：01=16、02=17、03=17、04=12、05=9、06=15、07=9、08=5、09=12、10=10。
+用例总数 **177** 条：01=20、02=20、03=24、04=20、05=12、06=21、07=14、08=14、09=15、10=17。
 
 ## 执行方式汇总
 
@@ -101,6 +101,7 @@
 | 多设备同步 | 多数 | — | 双后端对照（不适用） |
 | Bin | 多数 | 磁盘不足环境构造 | — |
 | 电量/日志 | 多数 | 电量变化观察 | — |
+| 系统级异常 | 多数 | 蓝牙/息屏/前后台切换 | 飞行模式/多应用竞争 |
 | 异步接口 | 多数 | — | — |
 | 底层接口与边界 | 多数 | INVALID 触发 | 已移除接口（不适用） |
 | 人工硬件 | — | 蓝牙开关/断电恢复 | 距离/遮挡等硬件场景 |

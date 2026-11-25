@@ -13,6 +13,7 @@ app/build/
 
 # 本地测试产物 / 诊断数据（不提交）
 /_diag_pull/
+/Test Cases/Automation/reports/
 /sensor_logs_*/
 /.screenshots/
 /app/libs/_aar_tmp/

@@ -40,6 +40,12 @@ val miscCases = listOf(
         val algo = SensorAlgo()
         check(algo.safeInit(), "SensorAlgo.init 返回 false")
         try {
+            // 无数据时 getResult 会返回初始占位行（STEP=0 / TIMESTAMP=-1 / VALID=0），
+            // 这是正常空态而非脏数据（见 DATA-ROB-003），因此以「推送前后 STEP 不变」为判据。
+            val beforeResult = algo.safeResult("EEG")
+            check(!algoError(beforeResult), "初始 getResult(EEG) 不应报错: $beforeResult")
+            val before = algoRows(beforeResult).lastOrNull()?.firstOrNull()?.toIntOrNull()
+
             val empty = algo.safePush(arrayOf(), 5_000)
             log("pushSamples(arrayOf()) -> $empty")
             check(!empty, "空数组推送应被拒绝/忽略（返回 false），实际=$empty")
@@ -52,11 +58,13 @@ val miscCases = listOf(
 
             val result = algo.safeResult("EEG", 5_000)
             log("空/null 推送后 getResult(EEG) -> ${result.trim().take(80)}")
+            check(!algoError(result), "空/null 推送后 getResult 不应报错: $result")
+            val after = algoRows(result).lastOrNull()?.firstOrNull()?.toIntOrNull()
             check(
-                algoError(result) || algoRows(result).isEmpty(),
-                "空/null 推送不应产生脏结果: $result",
+                after == before,
+                "空/null 推送不应推进算法结果（before STEP=$before after STEP=$after）: $result",
             )
-            "empty=false null=false"
+            "before=$before after=$after"
         } finally {
             runCatching { algo.destroy() }
         }
@@ -76,20 +84,33 @@ val miscCases = listOf(
                     CerelaxSpec.expectedChannels(spec, key)?.let { it != eegChannels } == true
             } ?: skip("没有可独立开关且通道数与 EEG($eegChannels) 不同的流，无法构造不匹配批次")
 
-        val alt = collectAlgoBatches(altKey, 100, 1_000)
+        val alt = collectAlgoBatches(altKey, 100, 1_000, profile = p)
+        val batch = alt.first()
+        val actualChannels = batch.channelCount
+        val batchType = DataType.nameOf(batch.dataType)
+        check(
+            actualChannels > 0 && actualChannels != eegChannels,
+            "构造的批次通道数($actualChannels)应与 EEG($eegChannels) 不同",
+        )
         val algo = SensorAlgo()
         check(algo.safeInit(), "SensorAlgo.init 返回 false")
         try {
             algo.safeSetParam("EEG_SAMPLE_RATE", "1000")
-            val before = runCatching { algoStep(algo.safeResult("EEG")) }.getOrNull()
+            // 基线必须可解析：getResult 报错/无数据行时不能把 null == null 当成通过。
+            val beforeResult = algo.safeResult("EEG")
+            check(!algoError(beforeResult), "基线 getResult(EEG) 报错: $beforeResult")
+            val before = algoRows(beforeResult).lastOrNull()?.firstOrNull()?.toIntOrNull()
+            check(before != null, "基线 getResult(EEG) 无数据行，无法判定是否产生新结果: $beforeResult")
+
             val pushed = algo.safePush(alt.toTypedArray())
-            log("pushSamples($altKey ${alt.first().channelCount}ch) -> $pushed")
-            val after = runCatching { algoStep(algo.safeResult("EEG")) }.getOrNull()
+            log("pushSamples($altKey -> $batchType, ${actualChannels}ch) -> $pushed")
+            val afterResult = algo.safeResult("EEG")
+            val after = algoRows(afterResult).lastOrNull()?.firstOrNull()?.toIntOrNull()
             check(
-                after == before,
-                "通道数不匹配的批次不应产出新 EEG 结果行（before=$before after=$after）",
+                !pushed || after == before,
+                "通道数不匹配的批次不应被接受并产出新 EEG 结果（pushed=$pushed before=$before after=$after）",
             )
-            "pushed=$pushed alt=$altKey(${alt.first().channelCount}ch) step=$before"
+            "pushed=$pushed alt=$batchType(${actualChannels}ch) baseline=$before after=$after"
         } finally {
             runCatching { algo.destroy() }
         }
@@ -211,9 +232,11 @@ val miscCases = listOf(
     },
 
     // MISC-FUNC-007：DeviceState.INVALID 常量存在；未连接 init 不生效；状态机可恢复。
+    // 注意：INVALID 的真实触发路径属手工 semi-auto 用例（可能不可达），本自动用例只做
+    // 常量/状态机冒烟，不宣称验证「进入 INVALID」。
     auto(
-        "MISC-FUNC-007", "DeviceState.INVALID 常量存在、异常 init 不崩溃且状态机可恢复", CHAPTER, Priority.P2,
-        180_000,
+        "MISC-FUNC-007", "DeviceState.INVALID 常量存在 + 未连接 init 被拒 + 状态机可恢复（不含 INVALID 触发）",
+        CHAPTER, Priority.P2, 180_000,
     ) {
         // DeviceState / DataType 是 Java int 常量类（非 Kotlin enum），用 nameOf 做名称解析冒烟。
         check(DeviceState.nameOf(DeviceState.INVALID).isNotBlank(), "nameOf(INVALID) 不应为空")
@@ -302,8 +325,24 @@ val miscCases = listOf(
         "model=${info.modelName} streams=${spec.streams.size}"
     },
 
-    // MISC-FUNC-009：onSuspend（App 退后台通知）重复调用不崩溃、不抛异常。auto（无需设备）。
-    auto("MISC-FUNC-009", "onSuspend 重复调用不抛异常", CHAPTER, Priority.P1) {
+    // MISC-FUNC-009：submit 后台线程执行器 —— Android 无 submit，不适用。
+    manual(
+        "MISC-FUNC-009", "submit 后台线程执行器（Android 无此接口）", CHAPTER, Priority.P2,
+        steps = listOf(
+            "Android 不适用：无 submit 线程调度 API，后台阻塞式调用改用 Kotlin suspend 扩展",
+        ),
+    ),
+
+    // MISC-FUNC-010：submit 执行阻塞式连接/断开 —— Android 无 submit，不适用。
+    manual(
+        "MISC-FUNC-010", "submit 执行阻塞式连接/断开（Android 无此接口）", CHAPTER, Priority.P2,
+        steps = listOf(
+            "Android 不适用：阻塞式 connect/disconnect 由 suspend 扩展（返回布尔）替代 submit",
+        ),
+    ),
+
+    // MISC-FUNC-012：onSuspend（App 退后台通知）重复调用不崩溃、不抛异常。auto（无需设备）。
+    auto("MISC-FUNC-012", "onSuspend 重复调用不抛异常", CHAPTER, Priority.P1) {
         try {
             controller.onSuspend()
             controller.onSuspend()

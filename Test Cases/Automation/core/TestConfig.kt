@@ -30,7 +30,7 @@ object TestConfig {
     /** 本轮目标设备 identity（逗号分隔，可多个）。 */
     val TARGET_IDENTITY: String get() = config.targetIdentity
 
-    /** demo 页运行时切换目标设备（逗号分隔多 identity，如 "8517,A2A2"）。 */
+    /** demo 页运行时切换目标设备（逗号分隔多 identity，如 "8517,9AA7"）。 */
     fun setTargetIdentity(value: String) = ConfigStore.setTargetIdentity(value)
 
     /** 目标设备写回设备端外部 config.json；返回是否成功。 */

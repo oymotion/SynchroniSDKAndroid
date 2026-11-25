@@ -26,7 +26,7 @@
 {"model": "OB6000C", "namePrefix": "OB6000C", "mac": "78:1C:9D:E4:6C:6B", "identity": "6C6B"}
 ```
 
-- `targetIdentity` 默认值仍为 `8517`（Cerelax-Pro）；**测 OB6000C 时把 `targetIdentity` 改为 `6C6B`**。
+- `targetIdentity` 默认值仍为 `9746`（Cerelax-Pro）；**测 OB6000C 时把 `targetIdentity` 改为 `6C6B`**。
 - 匹配规则统一走 `TestConfig.matchesTarget()`：MAC 精确匹配优先，其次广播名后四位等于 identity；不硬编码 MAC 到用例。
 - 修改外部 JSON（设备端 `/sdcard/Android/data/com.oymotion.sensorcapiktdemo/files/automation/`）即可切换目标设备，无需重编 APK。
 
@@ -106,7 +106,7 @@
 | [05_多设备同步.md](./05_多设备同步.md) | `MULTI-*`：同步起流/停流（需 ≥2 台） |
 | [06_Bin录制回放解析.md](./06_Bin录制回放解析.md) | `BIN-*`：录制、回放、暂停/恢复/停止、CSV、多 bin |
 | [07_电量日志调试.md](./07_电量日志调试.md) | `BATT-*` / `LOG-*` |
-| [08_人工硬件用例.md](./08_人工硬件用例.md) | `HW-MAN-*`：人工/仪器用例 |
+| [08_人工硬件用例.md](./08_人工硬件用例.md) | `HW-MAN-*`：人工/仪器用例；`SYS-ROB-*`：系统级异常场景 |
 | [09_异步接口.md](./09_异步接口.md) | `ASYNC-*`：suspend 扩展与 CompletableFuture 变体 |
 | [10_底层接口与边界补充.md](./10_底层接口与边界补充.md) | `MISC-*`：SensorData/DeviceInfo/Invalid/不适用 Android 接口 |
 
@@ -121,6 +121,7 @@
 | 多设备同步 | 多数 | 第二台设备上下电 | — |
 | Bin | 多数 | 磁盘不足、文件导出 | — |
 | 电量/日志 | 多数 | 电量变化观察 | — |
+| 系统级异常 | 多数 | 蓝牙/息屏/前后台切换 | 飞行模式/多应用竞争 |
 | 异步接口 | 多数 | — | — |
 | 底层接口与边界 | 多数 | Invalid 触发 | — |
 | 人工硬件 | — | — | 全部 |

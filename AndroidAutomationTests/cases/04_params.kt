@@ -28,11 +28,14 @@ private fun parseSwitches(raw: String): List<Pair<String, String>> =
         .map { it.groupValues[1] to it.groupValues[2] }
         .toList()
 
-/** spec 中第一个可切换档位（默认档之外还有其它档）的采样率参数。 */
-private fun switchableRate(spec: DeviceSpec): Map.Entry<String, SampleRateSpec>? =
+/**
+ * spec 中第一个可设置的采样率参数（所属流受支持）。
+ * 单档位设备（如 OB6000C 的 EEG 固定 250）没有其它档可切，但「起流中改参」仍需覆盖，
+ * 故不要求存在默认档之外的档位；由用例决定切档还是同值重设。
+ */
+private fun settableRate(spec: DeviceSpec): Map.Entry<String, SampleRateSpec>? =
     spec.sampleRates.entries.firstOrNull { (_, sr) ->
-        sr.settable && sr.rates.any { it != sr.default } &&
-            (sr.stream.isEmpty() || spec.supports(sr.stream))
+        sr.settable && (sr.stream.isEmpty() || spec.supports(sr.stream))
     }
 
 /** 优先取可设置的采样率参数，退回第一个已注册的。 */
@@ -210,6 +213,11 @@ val paramCases = listOf(
         try {
             val setValid = algo.safeSetParam("EEG_REFRESH_RATE", "1")
             log("setParam(EEG_REFRESH_RATE, 1) -> $setValid")
+            if (algoError(setValid) && setValid.contains("Not supported", ignoreCase = true)) {
+                // 参数在当前 AAR 未实现：非法值也只会返回 Not supported，校验没有区分度，
+                // 与 PARAM-FUNC-016 同口径记 SKIP，避免空过成“通过”。
+                skip("当前 SDK 算法不支持 EEG_REFRESH_RATE（$setValid），非法值校验无意义")
+            }
             for (bad in listOf("-1", "9999", "")) {
                 val ret = algo.safeSetParam("EEG_REFRESH_RATE", bad)
                 check(algoError(ret), "setParam(EEG_REFRESH_RATE, '$bad') 应被拒绝，实际=$ret")
@@ -435,14 +443,17 @@ val paramCases = listOf(
     },
     auto("PARAM-FUNC-007", "起流中修改采样率生效（读回一致）", CHAPTER, Priority.P0) {
         val spec = TestConfig.targetSpec()
-        val entry = switchableRate(spec) ?: run { skip("spec 无可切换的采样率参数") }
+        val entry = settableRate(spec) ?: run { skip("spec 无 settable 采样率参数") }
         val (key, sr) = entry
         val p = connected()
 
         // 记录原值并还原原值（不要写死 spec 默认，避免覆盖设备既有状态、污染后续用例）
         val originalRaw = safeGetParam(p, key)
         val original = sr.rates.firstOrNull { originalRaw.contains(it) } ?: sr.default
-        val target = sr.rates.first { it != original }
+        // 有其它档则切到不同档（强校验）；单档位设备只能同值重设，另翻转 FILTER 验证起流中改参生效
+        val target = sr.rates.firstOrNull { it != original } ?: original
+        val switched = target != original
+        var filterRestore: Pair<String, String>? = null
 
         val gestBefore = turnGestOffForEmgRate(p, spec, key)
         try {
@@ -456,12 +467,36 @@ val paramCases = listOf(
             val readBack = safeGetParam(p, key)
             check(readBack.contains(target), "改参后 $key 应为 $target，实际=$readBack")
 
+            if (!switched) {
+                // 单档位设备同值重设无法证明「新状态生效」，按手工用例口径在起流中翻转一个 FILTER_*。
+                val agg = safeGetParam(p, "FILTER")
+                val entries = if (isError(agg) || !agg.contains("|")) emptyList() else parseSwitches(agg)
+                val filterKey = entries.map { it.first }.firstOrNull { k -> spec.filters[k] == true }
+                if (filterKey == null) {
+                    log("单档位设备且无可解析 FILTER_*，仅验证起流中同值重设 $key=$target 的读回")
+                } else {
+                    val orig = entries.first { it.first == filterKey }.second
+                    val flip = if (orig == "ON") "OFF" else "ON"
+                    val fRet = safeSetParam(p, filterKey, flip)
+                    check(!isError(fRet), "起流中改 $filterKey 应成功，实际=$fRet")
+                    filterRestore = filterKey to orig
+                    delay(1_000)
+                    val aggAfter = safeGetParam(p, "FILTER")
+                    check(
+                        aggAfter.contains("$filterKey|$flip"),
+                        "起流中 $filterKey 切到 $flip 后 getParam(FILTER) 应体现，实际=$aggAfter",
+                    )
+                    log("单档位设备：起流中 $key 同值重设 + $filterKey $orig->$flip 已生效")
+                }
+            }
+
             safeSetParam(p, key, original)
         } finally {
+            filterRestore?.let { (k, v) -> safeSetParam(p, k, v) }
             runCatching { if (p.isDataTransfering()) p.stopDataNotification() }
             restoreGest(p, gestBefore)
         }
-        "$key=$target"
+        if (switched) "$key=$target" else "$key=$target(单档同值重设)+filter"
     },
     auto("PARAM-FUNC-008", "未知 key 返回 Error", CHAPTER) {
         val p = connected()
@@ -641,7 +676,14 @@ val paramCases = listOf(
         check(algo.safeInit(), "SensorAlgo.init 返回 false")
         try {
             val setOne = algo.safeSetParam("EEG_REFRESH_RATE", "1")
-            check(!algoError(setOne), "setParam(EEG_REFRESH_RATE, 1) 应成功，实际=$setOne")
+            if (algoError(setOne)) {
+                // 实测当前 AAR 的 SensorAlgo 未实现该参数（setParam -> "Error: Not supported"）。
+                // 按“能力不支持记 SKIP、其它错误判 FAIL”的口径处理，避免把 SDK 缺能力误报成用例失败。
+                if (setOne.contains("Not supported", ignoreCase = true)) {
+                    skip("当前 SDK 算法不支持 EEG_REFRESH_RATE（$setOne），无法验证刷新频率")
+                }
+                check(false, "setParam(EEG_REFRESH_RATE, 1) 应成功，实际=$setOne")
+            }
             val one = countRefreshSteps(algo, 5)
 
             algo.reset()

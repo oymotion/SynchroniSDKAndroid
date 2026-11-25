@@ -5,10 +5,10 @@
   "streams": {
     "NTF_EMG": {"supported": true, "channels": 8},
     "NTF_GEST": {"supported": true, "channels": 1},
-    "NTF_GFORCE_ACC": {"supported": false, "channels": 0},
-    "NTF_GFORCE_GYRO": {"supported": false, "channels": 0},
-    "NTF_GFORCE_EULER": {"supported": false, "channels": 0},
-    "NTF_GFORCE_QUAT": {"supported": false, "channels": 0},
+    "NTF_GFORCE_ACC": {"supported": true, "channels": 3},
+    "NTF_GFORCE_GYRO": {"supported": true, "channels": 3},
+    "NTF_GFORCE_EULER": {"supported": true, "channels": 3},
+    "NTF_GFORCE_QUAT": {"supported": true, "channels": 4},
     "NTF_IMU": {"supported": true, "channels": 13},
     "NTF_MAG": {"supported": false, "channels": 0},
     "NTF_ANGLE_DATA": {"supported": false, "channels": 0},
@@ -33,7 +33,7 @@
   },
   "sampleRates": {
     "EMG_SAMPLE_RATE": {"rates": ["500", "1000"], "default": "1000", "stream": "NTF_EMG", "settable": true, "coStream": null},
-    "IMU_SAMPLE_RATE": {"rates": ["50", "100", "200"], "default": "50", "stream": "NTF_IMU", "settable": true, "coStream": null, "subStreams": ["NTF_ACC", "NTF_GYRO", "NTF_EULER_DATA", "NTF_QUATERNION"]},
+    "IMU_SAMPLE_RATE": {"rates": ["50", "100", "200"], "default": "50", "stream": "NTF_IMU", "settable": true, "coStream": "NTF_EMG", "subStreams": ["NTF_ACC", "NTF_GYRO", "NTF_EULER_DATA", "NTF_QUATERNION"]},
     "IMPEDANCE": {"rates": ["1"], "default": "1", "stream": "NTF_IMPEDANCE", "settable": false, "coStream": "NTF_EMG"}
   }
 }

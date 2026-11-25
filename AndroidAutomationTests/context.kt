@@ -44,11 +44,30 @@ object ControllerProvider {
     }
 }
 
+/**
+ * 宿主 UI 信号：半自动用例判断「人工动作是否真的发生」需要 Activity 级信息。
+ * 无 UI（Instrumentation 直跑）时用 [None]，相关用例会因检测不到动作而记 SKIP。
+ */
+interface HostSignals {
+    /** 当前屏幕方向（ActivityInfo.SCREEN_ORIENTATION_*）；未知返回 0。 */
+    fun orientation(): Int = 0
+    /** 是否处于分屏/多窗口；未知返回 false。 */
+    fun inMultiWindow(): Boolean = false
+    /** 宿主 Activity 累计 onStop 次数（用于判定「切后台」是否真的发生）。 */
+    fun backgroundStops(): Int = 0
+
+    companion object {
+        val None: HostSignals = object : HostSignals {}
+    }
+}
+
 class TestContext(
     val androidContext: Context,
     val log: (String) -> Unit,
     /** semi-auto 用例的人工步骤提示：UI 弹出独立提示并等待用户确认后才继续；无 UI 时为空实现。 */
     private val prompt: suspend (String) -> Unit = {},
+    /** 宿主信号（旋转/分屏/切后台的动作检测）；默认空实现，相关用例记 SKIP。 */
+    val hostSignals: HostSignals = HostSignals.None,
 ) {
     /**
      * 半自动用例在需要人工动作（如关机/开机）时调用：每次只提示一个动作，用户确认后才继续，
@@ -94,11 +113,21 @@ class TestContext(
         controller.scan(timeoutMs).firstOrNull { TestConfig.matchesTarget(it) }
 
     suspend fun requireTarget(): SensorProfile {
-        val device = scanTarget() ?: throw AssertionError(
-            "未扫描到目标设备 identity=${TestConfig.TARGET_IDENTITY}，请确认设备已开机"
-        )
-        return controller.requireSensor(device.mac)?.also { usedProfiles.add(it) }
-            ?: throw AssertionError("requireSensor(${device.mac}) 返回 null")
+        val device = scanTarget()
+        if (device != null) {
+            return controller.requireSensor(device.mac)?.also { usedProfiles.add(it) }
+                ?: throw AssertionError("requireSensor(${device.mac}) 返回 null")
+        }
+        // 兜底：关/开蓝牙后 SDK 自动重连会占住设备，设备停止广播导致 scan 不到，
+        // 但 profile 仍在 connectedSensors 里——直接复用，避免后续用例全部「连不上」。
+        val cached = runCatching { controller.connectedSensors }.getOrNull().orEmpty()
+            .firstOrNull { runCatching { TestConfig.matchesTarget(it.device) }.getOrDefault(false) }
+        if (cached != null) {
+            log("[兜底] 未扫描到目标（可能自动重连后停止广播），复用已连接 profile ${cached.device.mac}")
+            usedProfiles.add(cached)
+            return cached
+        }
+        throw AssertionError("未扫描到目标设备 identity=${TestConfig.TARGET_IDENTITY}，请确认设备已开机")
     }
 
     /**
@@ -130,14 +159,29 @@ class TestContext(
             waitFor({ profile.isReady() }, TestConfig.READY_TIMEOUT_MS, "设备 Ready")
         }
         if (init && !profile.hasInited()) {
-            check(
-                profile.init(
-                    TestConfig.PACKAGE_SAMPLE_COUNT,
-                    TestConfig.INIT_TIMEOUT_MS,
-                    TestConfig.POWER_REFRESH_MS,
-                ),
-                "init() 返回 false",
+            var inited = profile.init(
+                TestConfig.PACKAGE_SAMPLE_COUNT,
+                TestConfig.INIT_TIMEOUT_MS,
+                TestConfig.POWER_REFRESH_MS,
             )
+            if (!inited) {
+                // 偶发 init 失败（实测 gForceMax：fetchDeviceInfo 命令 0x02 超时 30s，init result=0），
+                // 属 BLE 链路抖动；与 connectWithRetry 同口径，断开重连后重试一次，仍失败才判 FAIL。
+                log("init 失败，断开重连后重试一次")
+                runCatching { profile.disconnect() }
+                delay(2_000)
+                val reconnected =
+                    withTimeoutOrNull(TestConfig.CONNECT_TIMEOUT_MS) { profile.connect() } ?: false
+                if (reconnected) {
+                    waitFor({ profile.isReady() }, TestConfig.READY_TIMEOUT_MS, "设备 Ready（init 重试）")
+                    inited = profile.init(
+                        TestConfig.PACKAGE_SAMPLE_COUNT,
+                        TestConfig.INIT_TIMEOUT_MS,
+                        TestConfig.POWER_REFRESH_MS,
+                    )
+                }
+            }
+            check(inited, "init() 返回 false")
         }
         // 失败现场留证：把 live BLE 数据录成 bin，落到本用例诊断目录（LOG_PATH）。
         if (DIAG_BIN_ENABLED) {
@@ -361,8 +405,11 @@ internal suspend fun TestContext.collectAlgoBatches(
     minSamples: Int,
     minDurationMs: Long = 0,
     timeoutMs: Long = 60_000,
+    profile: SensorProfile? = null,
 ): List<SensorData> {
-    val p = connected()
+    // 同一用例内多次采集必须复用已连接 profile：BLE 设备连接后停止广播，
+    // 重复 connected() 内部的扫描会找不到目标设备（DATA-ROB-004 / DATA-FUNC-011）。
+    val p = profile ?: connected()
     val paramKey = CerelaxSpec.paramKey(streamKey)
     val onRet = try {
         p.setParam(paramKey, "ON")
@@ -394,9 +441,32 @@ internal suspend fun TestContext.collectAlgoBatches(
     return queue.toList()
 }
 
+/**
+ * 把 getResult() 输出规范化为「表头 + 数据行」布局。
+ *
+ * SDK 1.4.6 实测 EEG/PPG 返回单行 KEY|VALUE 序列，例如
+ * `STEP|1|TIMESTAMP|1795493107.894|VALID|1|RELAX|-1|CONCENTRATE|0|POSITION|0`；
+ * 手工用例文档描述的是 `STEP|TIMESTAMP|...` 表头 + 全数值数据行。
+ * 这里只展开 KEY|VALUE 形态（键非数值、值可解析为数值），其余行原样保留，
+ * 让 [algoRows]/[algoHeader]/[algoStep] 两种格式共用一套解析。
+ */
+internal fun normalizeAlgoResult(result: String): String =
+    result.lineSequence().joinToString("\n") { raw ->
+        val tokens = raw.trim().split('|').map { it.trim() }
+        val isKeyValue = tokens.size >= 4 && tokens.size % 2 == 0 &&
+            tokens.filterIndexed { i, _ -> i % 2 == 0 }.all { it.isNotEmpty() && it.toDoubleOrNull() == null } &&
+            tokens.filterIndexed { i, _ -> i % 2 == 1 }.all { it.isNotEmpty() && it.toDoubleOrNull() != null }
+        if (isKeyValue) {
+            tokens.filterIndexed { i, _ -> i % 2 == 0 }.joinToString("|") + "\n" +
+                tokens.filterIndexed { i, _ -> i % 2 == 1 }.joinToString("|")
+        } else {
+            raw
+        }
+    }
+
 /** 结果文本中的数据行（跳过 `STEP|...` 表头；NO_HEADER 输出全部是数据行）。 */
 internal fun algoRows(result: String): List<List<String>> =
-    result.lineSequence()
+    normalizeAlgoResult(result).lineSequence()
         .map { it.trim() }
         .filter { it.contains('|') }
         .map { line -> line.split('|').map { it.trim() } }
@@ -405,7 +475,7 @@ internal fun algoRows(result: String): List<List<String>> =
 
 /** 结果里的表头行（如 `STEP|TIMESTAMP|VALID|RELAX|CONCENTRATE|POSITION`），无表头返回 null。 */
 internal fun algoHeader(result: String): List<String>? =
-    result.lineSequence()
+    normalizeAlgoResult(result).lineSequence()
         .map { it.trim() }
         .filter { it.contains('|') }
         .map { line -> line.split('|').map { it.trim() } }

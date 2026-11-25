@@ -66,10 +66,19 @@ object CerelaxSpec {
      *
      * 部分设备的聚合流不单独回传聚合类型，而是拆成子流：例如 Cerelax 的 `NTF_IMU`
      * （DeviceInfo.imuChannelCount=6）实测回调为 `NTF_ACC`(3) + `NTF_GYRO`(3)，
-     * 从不出现 `NTF_IMU`。等待数据时应同时接受「聚合」与「拆分子流」两种形态。
+     * 从不出现 `NTF_IMU`。OB6000C 的 13 通道 IMU 更是拆成
+     * `NTF_ACC`(3)+`NTF_GYRO`(3)+`NTF_EULER`(3)+`NTF_QUATERNION`(4)。
+     * 等待数据时应同时接受「聚合」与「拆分子流」两种形态，子流清单与
+     * [aggregateLayoutOk] 校验的 `imuSubChannels` 保持一致。
      */
     fun dataTypesForKey(key: String): List<Int> = when (key) {
-        "NTF_IMU" -> listOf(DataType.NTF_IMU, DataType.NTF_ACC, DataType.NTF_GYRO)
+        "NTF_IMU" -> listOf(
+            DataType.NTF_IMU,
+            DataType.NTF_ACC,
+            DataType.NTF_GYRO,
+            DataType.NTF_EULER,
+            DataType.NTF_QUATERNION,
+        )
         else -> listOfNotNull(KEY_TO_DATA_TYPE[key])
     }
 

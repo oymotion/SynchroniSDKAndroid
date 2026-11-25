@@ -13,6 +13,8 @@
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- SYS-ROB-004 读取 WiFi 开关状态；normal 权限，安装即授予 -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- /sdcard access for bin replay / SDK logs on API 28 and below;
          all-files access (granted from the system settings page) covers
          /sdcard/Documents/sensorsdklog and bin export on Android 11+. -->
@@ -23,8 +25,12 @@
         android:label="SensorCapiKtDemo"
         android:theme="@android:style/Theme.Material.Light"
         android:allowBackup="false">
+        <!-- 旋转/分屏不重建 Activity：重建会走 onDestroy -> SensorController.terminate()，
+             terminate 在 Android 上是终止态，导致已连接的流与全部数据丢失（等同重进 App），
+             SYS-ROB-007「旋转/分屏后数据恢复」也就无法验证。 -->
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

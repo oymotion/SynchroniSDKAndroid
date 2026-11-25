@@ -38,7 +38,7 @@ private suspend fun waitReady(p: SensorProfile): Boolean {
  * 多轮扫描收集已登记设备（mac 去重），不足 [minCount] 时由 [requireDevices] 记 SKIP。
  *
  * 已登记设备来自 `automation/config.json` 的 devices 清单（如 Cerelax-Pro 8517、
- * gForceMax A2A2、OB6000C 6C6B），匹配口径统一走 [TestConfig.matchesKnown]。
+ * gForceMax 9AA7、OB6000C 6C6B），匹配口径统一走 [TestConfig.matchesKnown]。
  */
 private suspend fun TestContext.knownProfiles(minCount: Int): List<SensorProfile> {
     val byMac = LinkedHashMap<String, SensorProfile>()

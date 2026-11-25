@@ -347,8 +347,11 @@ class CerelaxParamTest {
     @Test
     fun paramFunc007_changeParamDuringStream_takesEffect() = runBlocking<Unit> {
         val sp = spec()
-        val eeg = sp.sampleRates["EEG_SAMPLE_RATE"]
-        assumeTrue("spec 未注册 EEG_SAMPLE_RATE（本型号无 EEG），跳过", eeg != null)
+        val entry = sp.sampleRates.entries.firstOrNull { (_, sr) ->
+            sr.settable && (sr.stream.isEmpty() || sp.supports(sr.stream))
+        }
+        assumeTrue("spec 无 settable 采样率参数，跳过", entry != null)
+        val (key, sr) = entry!!
 
         val device = requireTarget()
         val p = connectReady(device)
@@ -358,21 +361,53 @@ class CerelaxParamTest {
         assertTrue("startDataNotification 失败", p.startDataNotification())
         assertTrue("起流后 isDataTransfering 应为 true", p.isDataTransfering())
 
-        // 起流中改采样率；记录原值并还原原值（不要写死 spec 默认，避免污染后续用例/下一轮）
-        val originalRaw = safeGetParam(p, "EEG_SAMPLE_RATE")
-        val original = eeg!!.rates.firstOrNull { originalRaw.contains(it) } ?: eeg.default
-        val target = eeg.rates.first { it != original }
-        val ret = safeSetParam(p, "EEG_SAMPLE_RATE", target)
-        assertTrue("起流中改参应成功，实际=$ret", !isError(ret))
+        // 记录原值并还原原值（不要写死 spec 默认，避免覆盖设备既有状态、污染后续用例/下一轮）
+        val originalRaw = safeGetParam(p, key)
+        val original = sr.rates.firstOrNull { originalRaw.contains(it) } ?: sr.default
+        // 有其它档则切到不同档；单档位设备（如 OB6000C EEG 固定 250）同值重设 + 翻转 FILTER
+        val target = sr.rates.firstOrNull { it != original } ?: original
+        val switched = target != original
+        var filterRestore: Pair<String, String>? = null
 
-        Thread.sleep(3000)
-        val readBack = safeGetParam(p, "EEG_SAMPLE_RATE")
-        assertTrue("改参后 getParam 应为 $target，实际=$readBack", readBack.contains(target))
+        try {
+            val ret = safeSetParam(p, key, target)
+            assertTrue("起流中改参应成功，实际=$ret", !isError(ret))
 
-        // 还原原值
-        safeSetParam(p, "EEG_SAMPLE_RATE", original)
-        p.stopDataNotification()
-        p.disconnect()
+            Thread.sleep(3000)
+            val readBack = safeGetParam(p, key)
+            assertTrue("改参后 getParam($key) 应为 $target，实际=$readBack", readBack.contains(target))
+
+            if (!switched) {
+                // 单档位设备同值重设无法证明「新状态生效」，按手工用例口径在起流中翻转一个 FILTER_*。
+                val agg = safeGetParam(p, "FILTER")
+                val entries =
+                    if (isError(agg) || !agg.contains("|")) emptyList() else CerelaxSpec.parseSwitchList(agg)
+                val filterKey = entries.map { it.first }.firstOrNull { k -> sp.filters[k] == true }
+                if (filterKey == null) {
+                    CerelaxTestSupport.log("单档位设备且无可解析 FILTER_*，仅验证起流中同值重设 $key=$target 的读回")
+                } else {
+                    val orig = entries.first { it.first == filterKey }.second
+                    val flip = if (orig == "ON") "OFF" else "ON"
+                    val fRet = safeSetParam(p, filterKey, flip)
+                    assertTrue("起流中改 $filterKey 应成功，实际=$fRet", !isError(fRet))
+                    filterRestore = filterKey to orig
+                    Thread.sleep(1000)
+                    val aggAfter = safeGetParam(p, "FILTER")
+                    assertTrue(
+                        "起流中 $filterKey 切到 $flip 后应体现，实际=$aggAfter",
+                        aggAfter.contains("$filterKey|$flip"),
+                    )
+                    CerelaxTestSupport.log("单档位设备：起流中 $key 同值重设 + $filterKey $orig->$flip 已生效")
+                }
+            }
+
+            // 还原原值
+            safeSetParam(p, key, original)
+        } finally {
+            filterRestore?.let { (k, v) -> safeSetParam(p, k, v) }
+            p.stopDataNotification()
+            p.disconnect()
+        }
     }
 
     /** PARAM-FUNC-008：未知 key 返回 Error 开头。 */

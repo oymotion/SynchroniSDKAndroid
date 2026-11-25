@@ -2,6 +2,7 @@
   "model": "Cerelax-Pro",
   "type": "脑电头环（2 通道 EEG + 2 通道 PPG + 6 轴 IMU 聚合 + 电极接触检测）",
   "namePrefix": "Cerelax",
+  "relax": true,
   "streams": {
     "NTF_EMG": {"supported": false, "channels": 0},
     "NTF_GEST": {"supported": false, "channels": 0},

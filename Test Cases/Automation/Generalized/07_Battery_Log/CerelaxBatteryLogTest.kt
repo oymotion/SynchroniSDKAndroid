@@ -286,9 +286,9 @@ class CerelaxBatteryLogTest {
         controller.setParam("DEBUG_ENABLED", "False")
     }
 
-    /** LOG-FUNC-002：setLogPath 自动创建目录 / 指向已存在文件被拒绝（Android: LOG_PATH）。 */
+    /** LOG-FUNC-002：setLogPath 自动创建目录 / 指向已存在文件按追加语义写入（Android: LOG_PATH）。 */
     @Test
-    fun logFunc002_logPath_dirCreate_existingFileRejected() = runBlocking<Unit> {
+    fun logFunc002_logPath_dirCreate_existingFileAppend() = runBlocking<Unit> {
         val parent = cacheDir()
         val newDir = File(parent, "sdklog_created_${System.currentTimeMillis()}")
         assertTrue("测试前目录不应存在", !newDir.exists())
@@ -300,15 +300,18 @@ class CerelaxBatteryLogTest {
 
         val existingFile = File(parent, "existing_${System.currentTimeMillis()}.txt")
         existingFile.writeText("x")
-        // 失败时 SDK 抛 IOException（不是返回 "Error..."），必须捕获后统一判定
+        // SDK 约定（已确认）：LOG_PATH 指向已存在文件时按追加写日志，"追加是期望的逻辑"。
+        // 因此不要求拒绝，只要求原内容作为前缀保留、不被截断/清空。
         val r2 = runCatching { controller.setParam("LOG_PATH", existingFile.absolutePath) }
             .getOrElse { "Error: ${it.message}" }
         CerelaxTestSupport.log("LOG_PATH(已存在文件) -> $r2")
-        // 手工用例只承诺"不覆盖文件"：拒绝或安全接受均可，但原内容不能被写坏
+        val content = existingFile.takeIf { it.isFile }?.readText() ?: ""
+        CerelaxTestSupport.log("已存在文件内容 -> $content")
         assertTrue(
-            "setLogPath 指向已存在文件不应覆盖原内容，实际=$r2",
-            existingFile.isFile && existingFile.readText() == "x"
+            "LOG_PATH 指向已存在文件应追加日志且不截断原内容，实际=$r2，内容=$content",
+            content.startsWith("x")
         )
+        controller.setParam("LOG_PATH", newDir.absolutePath) // 恢复合法目录，避免后续用例写入已删文件
         existingFile.delete()
     }
 

@@ -2,7 +2,9 @@ package com.oymotion.sensorcapiktdemo
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Application
 import android.graphics.Color
+import android.os.Bundle
 import android.os.Looper
 import android.text.Editable
 import android.text.TextWatcher
@@ -44,8 +46,33 @@ class AutomationScreen(
     private val controller: SensorController get() = controllerProvider()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    /** 宿主信号：08 章半自动用例据此判断旋转/分屏/切后台是否真的发生。 */
+    private var backgroundStops = 0
+    private val lifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
+        override fun onActivityStopped(stopped: Activity) {
+            if (stopped === activity) backgroundStops++
+        }
+        override fun onActivityCreated(created: Activity, savedInstanceState: Bundle?) = Unit
+        override fun onActivityStarted(started: Activity) = Unit
+        override fun onActivityResumed(resumed: Activity) = Unit
+        override fun onActivityPaused(paused: Activity) = Unit
+        override fun onActivitySaveInstanceState(saved: Activity, outState: Bundle) = Unit
+        override fun onActivityDestroyed(destroyed: Activity) = Unit
+    }
+    private val hostSignals = object : HostSignals {
+        override fun orientation(): Int = activity.resources.configuration.orientation
+        override fun inMultiWindow(): Boolean = activity.isInMultiWindowMode
+        override fun backgroundStops(): Int = this@AutomationScreen.backgroundStops
+    }
+
     private val runner = AutomationRunner { logger ->
-        TestContext(activity.applicationContext, logger) { message -> promptManual(message) }
+        TestContext(
+            androidContext = activity.applicationContext,
+            log = logger,
+            prompt = { message -> promptManual(message) },
+            hostSignals = hostSignals,
+        )
     }
     private val results = LinkedHashMap<String, TestResult>()
     private val logs = ArrayList<String>()
@@ -79,6 +106,7 @@ class AutomationScreen(
 
     init {
         TestConfig.bind(activity.applicationContext)
+        activity.application.registerActivityLifecycleCallbacks(lifecycleCallbacks)
         orientation = VERTICAL
         setPadding(dp(6), dp(6), dp(6), dp(6))
         buildToolbar()
@@ -539,6 +567,7 @@ class AutomationScreen(
     fun close() {
         runJob?.cancel()
         scope.cancel()
+        activity.application.unregisterActivityLifecycleCallbacks(lifecycleCallbacks)
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()

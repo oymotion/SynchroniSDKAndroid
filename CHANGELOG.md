@@ -1,8 +1,17 @@
 # 更新记录（Changelog）
 
-> 分支：`Testing`　日期：2026-11-24
+> 分支：`Testing`　日期：2026-11-25
 
-## 概览
+## 2026-11-25 手工用例同步
+
+- **Cerelax Pro**：手工用例 176 → 194。新增 `CTRL-FUNC-014/015/016`、`BATT-FUNC-005/006`、`MISC-BND-004~006`、`MISC-FUNC-012`、`SYS-ROB-001~009`。
+- **gForceMax**：手工用例 122 → 177。按 spec 补 55 条；未写入 16 条不适用用例（EEG/PPG/SPO2 等）。
+- **OB6000C**：手工用例 119 → 186。按 spec 补 67 条（含 EEG 真实性、算法、性能）；未写入 5 条不适用用例（PPG/SPO2 等）。
+- **08 章**：三个型号统一新增系统级异常场景 `SYS-ROB-001~009`（7 条 semi-auto + 2 条 manual）。
+- 自动化规模现状：Demo 188 条；Instrumentation 144 个方法（22 个 `@Ignore`），仍为子集。
+- 手工用例与自动化 ID 已按 spec 对齐；剩余差异仅为 `HW-MAN-*` 人工硬件项及 spec 不适用项。
+
+## 2026-11-24 概览
 
 本次更新以「**Android 自动化测试对齐 Python 仓库的 spec 驱动范式**」为主线，把原先散落在
 `app/src/androidTest/` 里的型号耦合用例，重构为「通用用例 + 外部配置/规格」的架构，并补齐了
@@ -60,7 +69,7 @@
   |---|---|---|
   | Cerelax-Pro | 8517 | BC:93:2A:3F:85:17 |
   | Cerelax-Pro | 9746 | BC:93:2A:3F:97:46 |
-  | gForceMax | A2A2 | BC:93:2A:3F:A2:A2 |
+  | gForceMax | 9AA7 | BC:93:2A:3F:9A:A7 |
   | OB6000C | 6C6B | 78:1C:9D:E4:6C:6B |
 
 - 新增手工用例目录：`Test Cases/Manual Cases/gForceMax/`、`Test Cases/Manual Cases/OB6000C/`。

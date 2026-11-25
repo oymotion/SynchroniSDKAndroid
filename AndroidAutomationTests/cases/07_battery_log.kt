@@ -227,7 +227,7 @@ val batteryLogCases = listOf(
             controller.setParam("DEBUG_ENABLED", "False")
         }
     },
-    auto("LOG-FUNC-002", "LOG_PATH 自动创建目录 / 已存在文件被拒绝", CHAPTER, Priority.P1) {
+    auto("LOG-FUNC-002", "LOG_PATH 自动创建目录 / 已存在文件追加写入", CHAPTER, Priority.P1) {
         val parent = androidContext.cacheDir
         val newDir = File(parent, "sdklog_created_${System.currentTimeMillis()}")
         check(!newDir.exists(), "测试前目录不应存在")
@@ -239,12 +239,14 @@ val batteryLogCases = listOf(
 
         val existingFile = File(parent, "existing_${System.currentTimeMillis()}.txt")
         existingFile.writeText("x")
-        // README 只承诺目录会被创建，未约定"指向已存在文件必须拒绝"：
-        // 接受 Error 拒绝，也接受 OK 安全降级；底线是不崩溃、不覆盖用户文件。
+        // SDK 约定（已确认）：LOG_PATH 指向已存在文件时按追加写日志，"追加是期望的逻辑"。
+        // 不要求拒绝，只要求原内容作为前缀保留、不被截断/清空。
         val r2 = runCatching { controller.setParam("LOG_PATH", existingFile.absolutePath) }
             .getOrElse { "Error: ${it.javaClass.simpleName}" }
         log("LOG_PATH(已存在文件) -> $r2")
-        check(existingFile.readText() == "x", "LOG_PATH 指向文件时不应覆盖文件内容")
+        val content = existingFile.takeIf { it.isFile }?.readText() ?: ""
+        log("已存在文件内容 -> $content")
+        check(content.startsWith("x"), "LOG_PATH 指向文件时应追加日志且不截断原内容")
         controller.setParam("LOG_PATH", newDir.absolutePath) // 恢复正常日志目录，避免影响后续用例
         existingFile.delete()
         "dir=$r1 file=$r2"

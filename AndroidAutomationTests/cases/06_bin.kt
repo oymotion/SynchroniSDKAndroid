@@ -396,18 +396,35 @@ val binCases = run {
         },
         auto("BIN-FUNC-013", "bin 回放 DataType 与 DeviceInfo ChannelCount>0 交叉验证",
             chapter, Priority.P1, 120_000) {
-            val path = binPathOrSkip()
+            // 现场录制目标设备自己的 bin：保证回放数据与 DeviceInfo/spec 同源，
+            // 避免复用 config.binPath 的跨型号预录 bin（如 gForceMax 目标回放 Cerelax-Pro bin）。
+            val path = recordBin()
             val info = controller.getBinFileInfo(path)
             if (info == null || !info.valid || info.deviceInfo == null) {
-                skip("getBinFileInfo 应返回有效 info")
+                throw AssertionError("新录制的 bin 应可被解析: $path")
             }
             val deviceInfo = info.deviceInfo!!
             val spec = TestConfig.targetSpec()
-            val expectedTypes = CerelaxSpec.supportedStreamKeys(spec).mapNotNull { key ->
+            // 能力来源只认 spec：bin CONFIG 的 deviceInfo 不保证记录全部流
+            //（实测 gForceMax 的 bin 里 gestChannelCount=0，但回放确实产出 NTF_GEST）。
+            val allowed = CerelaxSpec.supportedStreamKeys(spec)
+                .mapNotNull { CerelaxSpec.KEY_TO_DATA_TYPE[it] }
+                .toMutableSet()
+            if (DataType.NTF_IMU in allowed) {
+                allowed += listOf(
+                    DataType.NTF_ACC, DataType.NTF_GYRO,
+                    DataType.NTF_EULER, DataType.NTF_QUATERNION,
+                )
+            }
+            if (DataType.NTF_ACC in allowed || DataType.NTF_GYRO in allowed) {
+                allowed += DataType.NTF_IMU
+            }
+            if (allowed.isEmpty()) skip("目标 spec 应声明至少一种支持的模态")
+            // 仅用于日志：bin deviceInfo 自己声明了通道的模态（可能少于 spec）
+            val declaredTypes = CerelaxSpec.supportedStreamKeys(spec).mapNotNull { key ->
                 val type = CerelaxSpec.KEY_TO_DATA_TYPE[key] ?: return@mapNotNull null
                 if (CerelaxSpec.channelCount(deviceInfo, key) > 0) type else null
             }
-            if (expectedTypes.isEmpty()) skip("bin deviceInfo 应含至少一种支持的模态")
 
             val (p, _) = startReplay(path, realtime = false)
             val c = ReplayCollector()
@@ -422,21 +439,11 @@ val binCases = run {
             )
 
             // 设备能力 ≠ 录制时实际开启的流：只要求“回放不出现能力之外的模态”，缺失仅记录
-            val allowed = expectedTypes.toMutableSet()
-            if (DataType.NTF_IMU in allowed) {
-                allowed += listOf(
-                    DataType.NTF_ACC, DataType.NTF_GYRO,
-                    DataType.NTF_EULER, DataType.NTF_QUATERNION,
-                )
-            }
-            if (DataType.NTF_ACC in allowed || DataType.NTF_GYRO in allowed) {
-                allowed += DataType.NTF_IMU
-            }
             val unexpected = c.types.filter { it !in allowed }
             check(unexpected.isEmpty(), "回放出现能力声明之外的模态: $unexpected")
             check(c.types.isNotEmpty(), "回放应产生数据")
-            val missing = expectedTypes.filter { it !in c.types }
-            "expected=$expectedTypes got=${c.types} missing(录制可能未开)=$missing"
+            val missing = declaredTypes.filter { it !in c.types }
+            "allowed=$allowed got=${c.types} deviceInfoDeclared=$declaredTypes missing(录制可能未开)=$missing"
         },
         // 多设备配对录制：对齐 RN 的 MULTI-FUNC-003-REC，产出 ≥2 个不同 MAC 的 bin，
         // 把打印出的路径回填 config.json 的 multiBinPaths 后即可跑 BIN-FUNC-010。

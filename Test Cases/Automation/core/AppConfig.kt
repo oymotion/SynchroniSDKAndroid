@@ -87,10 +87,11 @@ data class AppConfig(
     companion object {
         /** 内置默认值：与 `Test Cases/Automation/config/config.json` 保持一致。 */
         val DEFAULT = AppConfig(
-            targetIdentity = "8517",
+            targetIdentity = "9746",
             devices = listOf(
                 TestDevice("Cerelax-Pro", "Cerelax", "BC:93:2A:3F:85:17", "8517"),
-                TestDevice("gForceMax", "gForceMax", "BC:93:2A:3F:A2:A2", "A2A2"),
+                TestDevice("Cerelax-Pro", "Cerelax", "BC:93:2A:3F:97:46", "9746"),
+                TestDevice("gForceMax", "gForceMax", "BC:93:2A:3F:9A:A7", "9AA7"),
                 TestDevice("OB6000C", "OB6000C", "78:1C:9D:E4:6C:6B", "6C6B"),
             ),
             params = AutomationParams(

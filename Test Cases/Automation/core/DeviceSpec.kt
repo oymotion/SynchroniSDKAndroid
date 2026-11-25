@@ -10,13 +10,13 @@ import org.json.JSONObject
  *   imuSubChannels 聚合流子通道组成（如 NTF_IMU = acc+gyro+euler+quat）
  *   filters        滤波开关（FILTER_* 支持 ON/OFF）
  *   sampleRates    采样率参数（档位/默认值/所属流/是否可设/共流）
+ *   relax          是否提供放松指数（SensorAlgo 的 RELAX），缺省 false
  *
  * 运行时来源：设备端外部 JSON > assets 内置默认（见 [SpecStore]）。
  * 测试只按 spec + DeviceInfo 运行时结果断言，不把型号数值写进用例。
  */
 
-/** 单条数据流的能力基线。 */
-data class StreamSpec(
+/** 单条数据流的能力基线。 */data class StreamSpec(
     val supported: Boolean,
     val channels: Int,
 )
@@ -40,6 +40,8 @@ data class DeviceSpec(
     val imuSubChannels: Map<String, Int> = emptyMap(),
     val filters: Map<String, Boolean> = emptyMap(),
     val sampleRates: Map<String, SampleRateSpec> = emptyMap(),
+    /** 是否提供放松指数（SensorAlgo `RELAX` 有效值 0~100）；未声明视为不支持。 */
+    val relax: Boolean = false,
 ) {
 
     /** 真正支持的流 key（supported=true 且 channels>0）。 */
@@ -109,6 +111,7 @@ data class DeviceSpec(
                 imuSubChannels = imuSubChannels,
                 filters = filters,
                 sampleRates = sampleRates,
+                relax = json.optBoolean("relax", false),
             )
         }
     }

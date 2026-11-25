@@ -61,7 +61,7 @@ Test Cases/Automation/
   "devices": [
     {"model": "Cerelax-Pro", "namePrefix": "Cerelax", "mac": "BC:93:2A:3F:85:17", "identity": "8517"},
     {"model": "Cerelax-Pro", "namePrefix": "Cerelax", "mac": "BC:93:2A:3F:97:46", "identity": "9746"},
-    {"model": "gForceMax",  "namePrefix": "gForceMax", "mac": "BC:93:2A:3F:A2:A2", "identity": "A2A2"},
+    {"model": "gForceMax",  "namePrefix": "gForceMax", "mac": "BC:93:2A:3F:9A:A7", "identity": "9AA7"},
     {"model": "OB6000C",    "namePrefix": "OB6000C",  "mac": "78:1C:9D:E4:6C:6B", "identity": "6C6B"}
   ]
 }
@@ -71,7 +71,7 @@ Test Cases/Automation/
 |---|---|
 | Cerelax-Pro（8517） | `"8517"` |
 | Cerelax-Pro（9746） | `"9746"` |
-| gForceMax | `"A2A2"` |
+| gForceMax | `"9AA7"` |
 | OB6000C | `"6C6B"` |
 
 改完跑测试即可（见 §6）。目标设备匹配统一走 `TestConfig.matchesTarget`：
@@ -310,3 +310,19 @@ adb pull /sdcard/Download/sensor_automation_report.json
 
 一句话：**Demo 运行先看报告定位失败用例 → 再抓 `adb logcat -s System.out` 看该用例的详细失败步骤；
 instrumentation 运行没有报告，直接看 Gradle 测试结果 + `adb logcat -s System.out`。**
+
+---
+
+## 12. 用例规模与覆盖现状
+
+| 层 | 规模 | 说明 |
+|---|---:|---|
+| Demo 自动化（`AndroidAutomationTests/`） | 188 条 | 覆盖全部可自动化手工用例；仅 `HW-MAN-*` 人工硬件项无自动化 |
+| Instrumentation（`Generalized/`） | 144 个方法 | Demo 的子集；其中 22 个 `@Ignore` |
+| Cerelax Pro 手工 | 194 条 | `Test Cases/Manual Cases/Cerelax Pro/` |
+| gForceMax 手工 | 177 条 | `Test Cases/Manual Cases/gForceMax/`，已按 spec 排除不适用能力 |
+| OB6000C 手工 | 186 条 | `Test Cases/Manual Cases/OB6000C/`，已按 spec 排除不适用能力 |
+
+- Instrumentation 尚未覆盖约 50 条 Cerelax 非人工用例（SensorAlgo 整段、`SYS-ROB-*`、部分 `MISC/BIN/MULTI/PARAM` 边界）。
+- 两套入口的用例 ID 与方法名映射一致；`@Ignore` 需区分“Android 不适用”和“未实现”。
+- 只有 Demo 侧生成 `report_*.json/.txt`；Instrumentation 以 Gradle 结果 + logcat 为准（见 §10、§11）。

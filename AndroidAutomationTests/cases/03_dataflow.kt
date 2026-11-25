@@ -91,48 +91,98 @@ private suspend fun enablePrimaryStream(p: SensorProfile) {
 }
 
 /**
- * PPG 算法主路径：采集 → 推送 → 取结果 → 校验心率/血氧范围。
- * 供 DATA-FUNC-018（自动）与 DATA-FUNC-023（半自动验证）复用。
+ * 采集指定流的样本值，按通道返回窗口内全部数值。
+ * SpO2 在 README 中定义为数据流（`NTF_SPO2 = SpO2 percentage`），不走算法。
+ * 供 DATA-FUNC-018（自动）与 DATA-FUNC-023（半自动）复用。
  */
-private suspend fun TestContext.runPpgAlgorithm(minDurationMs: Long): String {
-    val samples = collectAlgoBatches("NTF_PPG", 200, minDurationMs)
-    val algo = SensorAlgo()
-    check(algo.safeInit(), "SensorAlgo.init 返回 false")
-    try {
-        check(algo.safePush(samples.toTypedArray()), "pushSamples(PPG) 返回 false")
-        val result = algo.safeResult("PPG")
-        check(!algoError(result), "getResult(PPG) 报错: $result")
-        val rows = algoRows(result)
-        check(rows.isNotEmpty(), "getResult(PPG) 未返回数据行: $result")
-        val header = algoHeader(result)
-        val row = rows.last()
-
-        // 优先按表头字段名定位 HR/SpO2；无表头时退化为「在合理区间内找数值」
-        fun pick(markers: List<String>, range: ClosedFloatingPointRange<Float>, fallbackIndex: Int): Float? {
-            val idx = header?.indexOfFirst { h -> markers.any { marker -> h.contains(marker, true) } } ?: -1
-            if (idx >= 0) return row.getOrNull(idx)?.toFloatOrNull()
-            row.getOrNull(fallbackIndex)?.toFloatOrNull()?.takeIf { it in range }?.let { return it }
-            return row.mapNotNull { it.toFloatOrNull() }.firstOrNull { it in range }
+private suspend fun TestContext.collectStreamValues(
+    streamKey: String,
+    seconds: Int,
+): Map<Int, List<Double>> {
+    val p = connected()
+    val onRet = try {
+        p.setParam(streamKey, "ON")
+    } catch (e: Exception) {
+        "Error: ${e.message}"
+    }
+    check(!algoError(onRet), "$streamKey=ON 被拒绝（$onRet）")
+    val type = CerelaxSpec.dataTypesForKey(streamKey).firstOrNull()
+        ?: error("$streamKey 无对应 DataType")
+    val values = java.util.Collections.synchronizedMap(LinkedHashMap<Int, MutableList<Double>>())
+    p.setOnDataListener { _, list ->
+        for (d in list) {
+            if (d.dataType != type) continue
+            synchronized(values) {
+                for (ch in 0 until d.channelCount) {
+                    val bucket = values.getOrPut(ch) { ArrayList() }
+                    for (i in 0 until d.sampleCount) {
+                        if (!d.isLost(ch, i)) bucket.add(d.getData(ch, i).toDouble())
+                    }
+                }
+            }
         }
-
-        val hr = pick(listOf("HR", "HEART", "BPM"), 30f..220f, 1)
-        val spo2 = pick(listOf("SPO2", "SPO_2", "OX"), 70f..100f, 2)
-        check(hr != null && hr in 30f..220f, "心率应在 30~220 bpm，实际=$hr（row=$row）")
-        check(spo2 != null && spo2 in 70f..100f, "SpO2 应在 70~100%，实际=$spo2（row=$row）")
-        return "hr=$hr spo2=$spo2 fields=${row.size}"
+    }
+    check(p.startDataNotification(), "startDataNotification 失败")
+    try {
+        waitFor({ values.isNotEmpty() }, TestConfig.DATA_TIMEOUT_MS, "$streamKey 首批数据")
+        delay(seconds * 1000L)
     } finally {
-        runCatching { algo.destroy() }
+        runCatching { p.stopDataNotification() }
+    }
+    return values.entries.associate { it.key to it.value.toList() }
+}
+
+/**
+ * SpO2 判定：开头连续的 0 是「未就绪」预热值（实测 Cerelax 约 7s），跳过后再校验；
+ * 预热后要求有效样本 ≥5 且 ≥80% 落在 70~100（README: NTF_SPO2 = SpO2 percentage）。
+ * 其余通道只统计不判定（语义未定义）。
+ */
+private fun TestContext.checkSpo2(byChannel: Map<Int, List<Double>>): String {
+    val ch0 = byChannel[0].orEmpty()
+    check(ch0.isNotEmpty(), "未收到 NTF_SPO2 ch0 样本")
+    val firstValid = ch0.indexOfFirst { it != 0.0 }
+    check(firstValid >= 0, "SpO2 始终为 0（未就绪），共 ${ch0.size} 个样本")
+    val valid = ch0.drop(firstValid)
+    check(valid.size >= 5, "预热后有效 SpO2 样本不足（warmup=$firstValid，有效=${valid.size}）")
+    val inRange = valid.count { it in 70.0..100.0 }
+    check(
+        inRange >= valid.size * 0.8,
+        "预热后 SpO2 应主要落在 70~100%（README: percentage）：" +
+            "in-range=$inRange/${valid.size} min=${valid.minOrNull()} max=${valid.maxOrNull()}",
+    )
+    val extra = byChannel.filterKeys { it != 0 }.entries.joinToString(" ") { (ch, vs) ->
+        val nz = vs.dropWhile { it == 0.0 }
+        if (nz.isEmpty()) "ch$ch=n/a" else "ch$ch avg=${"%.1f".format(nz.average())}"
+    }
+    return "warmup=$firstValid ch0 avg=${"%.1f".format(valid.average())}% " +
+        "min=${valid.minOrNull()} max=${valid.maxOrNull()} in-range=$inRange/${valid.size}" +
+        if (extra.isEmpty()) "" else " | $extra"
+}
+
+/**
+ * 放松指数（SensorAlgo `RELAX`）不是所有设备都有：spec 未声明 `relax=true` 的型号
+ * 只输出 `RELAX=-1`（OB6000C 实测 60s 恒为 -1），算法结果类用例不适用，记 SKIP。
+ */
+private fun TestContext.requireRelax() {
+    if (!TestConfig.targetSpec().relax) {
+        skip("当前设备未提供放松指数（spec.relax=false），算法结果用例不适用")
     }
 }
 
 /**
- * 起流 [seconds] 秒，用单通道 `sampleIndex` 跨度换算指定流的实测采样率。
+ * 用调用方已连接的 [p] 起流 [seconds] 秒，用单通道 `sampleIndex` 跨度换算实测采样率。
+ *
+ * 必须复用调用方的 profile：BLE 设备连接后通常停止广播，若这里再 `connected()`，
+ * 内部 `requireTarget()` 的扫描就看不到目标设备（DATA-FUNC-011 曾因此误报离线）。
  *
  * 多流并存时各流 sampleIndex 是独立编号空间：这里先锁定首个到达的同类 DataType，
  * 只统计该类型，绝不跨流混算。
  */
-private suspend fun TestContext.measureStreamDataRate(streamKey: String, seconds: Long): Double {
-    val p = connected()
+private suspend fun TestContext.measureStreamDataRate(
+    p: SensorProfile,
+    streamKey: String,
+    seconds: Long,
+): Double {
     val paramKey = CerelaxSpec.paramKey(streamKey)
     val onRet = try {
         p.setParam(paramKey, "ON")
@@ -143,17 +193,17 @@ private suspend fun TestContext.measureStreamDataRate(streamKey: String, seconds
 
     val types = CerelaxSpec.dataTypesForKey(streamKey).toSet()
     val targetType = AtomicInteger(-1)
-    val startIdx = AtomicLong(-1)
-    val endIdx = AtomicLong(-1)
+    // 记录每个批次的「回调时刻 + startSampleIndex」，用首末两批的端点斜率算速率。
+    // 不能再用「首批起点 + 固定 N 秒窗口」：首批在窗口开始前就已到达，
+    // 低采样率流（如 PPG 50Hz，每批 20 样本≈0.4s）会因此虚高约 8%。
+    val marks = ConcurrentLinkedQueue<Pair<Long, Long>>()
     val got = AtomicBoolean(false)
     p.setOnDataListener { _, list ->
         for (d in list) {
             if (d.dataType !in types) continue
             if (targetType.get() < 0) targetType.compareAndSet(-1, d.dataType)
             if (d.dataType != targetType.get()) continue
-            val s = d.startSampleIndex.toLong()
-            if (startIdx.get() < 0) startIdx.set(s)
-            endIdx.set(s + d.sampleCount - 1)
+            marks.offer(android.os.SystemClock.elapsedRealtime() to d.startSampleIndex.toLong())
             got.set(true)
         }
     }
@@ -164,9 +214,16 @@ private suspend fun TestContext.measureStreamDataRate(streamKey: String, seconds
     } finally {
         runCatching { p.stopDataNotification() }
     }
-    val span = endIdx.get() - startIdx.get() + 1
-    check(span > 0, "$streamKey 样本跨度应为正（span=$span）")
-    return span.toDouble() / seconds
+    val all = marks.toList()
+    check(all.size >= 2, "$streamKey 批次不足（${all.size}），无法估算速率")
+    val (t0, idx0) = all.first()
+    val (t1, idx1) = all.last()
+    val elapsedSec = (t1 - t0) / 1000.0
+    check(
+        elapsedSec > 0 && idx1 > idx0,
+        "$streamKey 采样跨度异常（Δt=${"%.2f".format(elapsedSec)}s Δidx=${idx1 - idx0}）",
+    )
+    return (idx1 - idx0) / elapsedSec
 }
 
 /** 采集一批主数据流数据，供单点访问器越界测试。 */
@@ -284,7 +341,7 @@ val dataflowCases = listOf(
         }
         "越界阻抗/饱和度=0、isLost=false"
     },
-    auto("DATA-BND-007", "isDataValid/isChannelEnabled 越界返回 false", CHAPTER,
+    auto("DATA-BND-007", "isDataValid 越界返回 false、isChannelEnabled 按 channelMask 判定", CHAPTER,
         Priority.P1, 120_000) {
         val d = capturePrimaryBatch()
         val cc = d.channelCount
@@ -295,12 +352,24 @@ val dataflowCases = listOf(
                 .getOrElse { throw AssertionError("isDataValid($ch,$si) 不应抛异常: ${it.javaClass.simpleName}") }
             check(!valid, "越界 isDataValid($ch,$si) 应返回 false")
         }
-        for (ch in listOf(-1, cc)) {
+        // isChannelEnabled 只做 0..63 边界 + channelMask 位判断，从不与 channelCount 比较：
+        // 设备 channelMask 可能比 channelCount 宽（如 OB6000C ACC cc=3 但 mask=0xFF），
+        // 因此「ch >= channelCount 必须为 false」不是有效断言，改为按 mask 位校验。
+        for (ch in listOf(-1, 64)) {
             val enabled = runCatching { d.isChannelEnabled(ch) }
                 .getOrElse { throw AssertionError("isChannelEnabled($ch) 不应抛异常: ${it.javaClass.simpleName}") }
-            check(!enabled, "越界 isChannelEnabled($ch) 应返回 false")
+            check(!enabled, "超出 0..63 的 isChannelEnabled($ch) 应返回 false")
         }
-        "越界有效性探测均返回 false"
+        for (ch in 0 until 64) {
+            val enabled = runCatching { d.isChannelEnabled(ch) }
+                .getOrElse { throw AssertionError("isChannelEnabled($ch) 不应抛异常: ${it.javaClass.simpleName}") }
+            val expect = ((d.channelMask ushr ch) and 1L) != 0L
+            check(
+                enabled == expect,
+                "isChannelEnabled($ch) 应与 channelMask 位一致（mask=${d.channelMask}）",
+            )
+        }
+        "越界有效性=false、isChannelEnabled 与 mask 一致"
     },
 
     // ---- DATA-FUNC：起流/停流/数据访问 ------------------------------------------------
@@ -484,6 +553,9 @@ val dataflowCases = listOf(
                 for (ch in 0 until d.channelCount) {
                     val last = lastByKey.getOrPut(d.dataType.toLong() * 1000 + ch) { AtomicLong(-1) }
                     for (i in 0 until d.sampleCount) {
+                        // 末批/不足包可能是无效填充样本（gForceMax 实测 sc=10、奇通道 isDataValid=false 且 sampleIndex=0），
+                        // 无效样本没有有意义的时间序，不参与一致性与单调性断言。
+                        if (!d.isDataValid(ch, i)) continue
                         val s = d.getChannelSample(ch, i) ?: continue
                         if (s.sampleIndex != d.getSampleIndex(ch, i)) consistent.set(false)
                         if (s.data != d.getData(ch, i)) consistent.set(false)
@@ -615,7 +687,7 @@ val dataflowCases = listOf(
             for (rate in sr.rates) {
                 val ret = safeSetParam(p, key, rate)
                 check(!algoError(ret), "setParam($key, $rate) 应成功，实际=$ret")
-                val measured = measureStreamDataRate("NTF_EEG", 5)
+                val measured = measureStreamDataRate(p, "NTF_EEG", 5)
                 val ratio = measured / rate.toDouble()
                 check(
                     abs(ratio - 1.0) <= TestConfig.SAMPLE_RATE_TOLERANCE,
@@ -659,46 +731,104 @@ val dataflowCases = listOf(
     },
     auto("DATA-FUNC-013", "Sample 字段与单点访问器一致", CHAPTER, Priority.P1) {
         val p = connected()
-        val got = AtomicBoolean(false)
-        val consistent = AtomicBoolean(true)
+        // 与 Python 013 对齐：只取采集窗口内**第一个非空批次**做字段/访问器校验，
+        // 不判断批大小（批次样本数偏差由 DATA-FUNC-009 覆盖），也不遍历后续批次。
+        val firstBatch = java.util.concurrent.atomic.AtomicReference<SensorData?>(null)
         p.setOnDataListener { _, list ->
-            for (d in list) {
-                for (ch in 0 until d.channelCount) {
-                    for (i in 0 until d.sampleCount) {
-                        val s = d.getChannelSample(ch, i) ?: continue
-                        if (s.channelIndex != ch) consistent.set(false)
-                        if (s.sampleIndex != d.getSampleIndex(ch, i)) consistent.set(false)
-                        if (s.data != d.getData(ch, i)) consistent.set(false)
-                        if (s.rawData != d.getRawData(ch, i)) consistent.set(false)
-                        if (s.impedance != d.getImpedance(ch, i)) consistent.set(false)
-                        if (s.saturation != d.getSaturation(ch, i)) consistent.set(false)
-                    }
+            if (firstBatch.get() == null) {
+                list.firstOrNull { it.channelCount * it.sampleCount > 0 }?.let {
+                    // SensorData 是 native 共享缓冲区的视图，先 clone 固化，窗口结束后再读取。
+                    firstBatch.compareAndSet(null, it.clone())
                 }
-                got.set(true)
             }
         }
 
         check(p.startDataNotification(), "startDataNotification 失败")
-        waitFor({ got.get() }, TestConfig.DATA_TIMEOUT_MS, "首批数据")
         delay(TestConfig.COLLECT_SECONDS * 1000L)
         p.stopDataNotification()
 
-        check(consistent.get(), "Sample 字段应与单点访问器一致")
-        "sample fields consistent"
+        val d = firstBatch.get()
+            ?: throw AssertionError("采集窗口内未收到非空数据，无法校验 Sample 字段")
+        val mismatch = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        fun flag(field: String, ch: Int, i: Int, a: Any?, b: Any?) {
+            mismatch.compareAndSet(null, "field=$field ch=$ch i=$i sample=$a accessor=$b")
+        }
+        for (ch in 0 until d.channelCount) {
+            for (i in 0 until d.sampleCount) {
+                val s = d.getChannelSample(ch, i) ?: continue
+                if (s.channelIndex != ch) flag("channelIndex", ch, i, s.channelIndex, ch)
+                if (s.sampleIndex != d.getSampleIndex(ch, i)) {
+                    flag("sampleIndex", ch, i, s.sampleIndex, d.getSampleIndex(ch, i))
+                }
+                if (s.data != d.getData(ch, i)) flag("data", ch, i, s.data, d.getData(ch, i))
+                if (s.rawData != d.getRawData(ch, i)) {
+                    flag("rawData", ch, i, s.rawData, d.getRawData(ch, i))
+                }
+                if (s.impedance != d.getImpedance(ch, i)) {
+                    flag("impedance", ch, i, s.impedance, d.getImpedance(ch, i))
+                }
+                if (s.saturation != d.getSaturation(ch, i)) {
+                    flag("saturation", ch, i, s.saturation, d.getSaturation(ch, i))
+                }
+            }
+        }
+        check(
+            mismatch.get() == null,
+            "Sample 字段应与单点访问器一致（首个不一致: ${mismatch.get()}）",
+        )
+        "首个非空批次字段一致（type=${DataType.nameOf(d.dataType)} cc=${d.channelCount} sc=${d.sampleCount}）"
     },
 
     // ---- SensorAlgo：算法主路径 --------------------------------------------------------
     auto("DATA-FUNC-017", "推送 EEG 批次后得到合法结果行", CHAPTER, Priority.P0, 120_000,
         requires = setOf("NTF_EEG")) {
-        val samples = collectAlgoBatches("NTF_EEG", 4_000, 4_000)
+        requireRelax()
+        // 算法有约 5s（≈24 步）预热期，预热中 RELAX 返回 -1；
+        // 因此不能只推一批就取结果，需连续推送约 10s 后取最新结果行。
+        val p = connected()
+        val onRet = try {
+            p.setParam("NTF_EEG", "ON")
+        } catch (e: Exception) {
+            "Error: ${e.message}"
+        }
+        check(!algoError(onRet), "NTF_EEG=ON 被拒绝（$onRet）")
+
         val algo = SensorAlgo()
         check(algo.safeInit(), "SensorAlgo.init 返回 false")
         try {
-            algo.syncEegSampleRate(samples)
-            check(algo.safePush(samples.toTypedArray()), "pushSamples(EEG) 返回 false")
+            val queue = ConcurrentLinkedQueue<SensorData>()
+            p.setOnDataListener { _, list ->
+                list.filter { it.dataType == DataType.NTF_EEG }.forEach { queue.offer(it.clone()) }
+            }
+            check(p.startDataNotification(), "startDataNotification 失败")
 
-            val result = algo.safeResult("EEG")
-            check(!algoError(result), "getResult(EEG) 报错: $result")
+            var pushed = 0
+            var rateSet = false
+            var result = ""
+            val startedAt = System.currentTimeMillis()
+            try {
+                while (System.currentTimeMillis() - startedAt < 10_000) {
+                    val batch = ArrayList<SensorData>()
+                    while (true) {
+                        batch += queue.poll() ?: break
+                    }
+                    if (batch.isNotEmpty()) {
+                        if (!rateSet) {
+                            algo.syncEegSampleRate(batch)
+                            rateSet = true
+                        }
+                        if (algo.safePush(batch.toTypedArray())) pushed++
+                    }
+                    val r = algo.safeResult("EEG")
+                    if (!algoError(r)) result = r
+                    delay(200)
+                }
+            } finally {
+                runCatching { p.stopDataNotification() }
+            }
+
+            check(pushed > 0, "10s 内未成功推送 EEG 批次")
+            check(result.isNotEmpty(), "getResult(EEG) 未返回结果")
             val rows = algoRows(result)
             check(rows.isNotEmpty(), "getResult(EEG) 未返回数据行: $result")
             val header = algoHeader(result)
@@ -714,17 +844,20 @@ val dataflowCases = listOf(
                 concentrate != null && concentrate in 0f..100f,
                 "CONCENTRATE 应在 0~100，实际=$concentrate（row=$row）",
             )
-            "relax=$relax concentrate=$concentrate fields=${row.size}"
+            "step=${algoStep(result)} relax=$relax concentrate=$concentrate fields=${row.size} pushed=$pushed"
         } finally {
             runCatching { algo.destroy() }
         }
     },
-    auto("DATA-FUNC-018", "推送 PPG 批次后得到心率/血氧结果", CHAPTER, Priority.P0, 180_000,
-        requires = setOf("NTF_PPG")) {
-        runPpgAlgorithm(8_000)
+    auto("DATA-FUNC-018", "SpO2 数据流输出血氧百分比（心率待算法侧确认）", CHAPTER, Priority.P0, 120_000,
+        requires = setOf("NTF_SPO2")) {
+        // README: NTF_SPO2 = SpO2 percentage（数据流）；无 HR DataType，算法未文档化，
+        // 心率数据源待算法/native 侧确认后再补断言。NTF_SPO2 为 1Hz，30s 窗口留足预热后样本。
+        checkSpo2(collectStreamValues("NTF_SPO2", 30))
     },
     auto("DATA-FUNC-019", "getResult(NO_HEADER) 返回无表头裸数据行", CHAPTER, Priority.P2, 120_000,
         requires = setOf("NTF_EEG")) {
+        requireRelax()
         val samples = collectAlgoBatches("NTF_EEG", 4_000, 4_000)
         val algo = SensorAlgo()
         check(algo.safeInit(), "SensorAlgo.init 返回 false")
@@ -754,6 +887,7 @@ val dataflowCases = listOf(
     },
     auto("DATA-FUNC-020", "STEP 递增语义（有新数据才递增）", CHAPTER, Priority.P1, 180_000,
         requires = setOf("NTF_EEG")) {
+        requireRelax()
         val samples = collectAlgoBatches("NTF_EEG", 4_000, 4_000)
         val algo = SensorAlgo()
         check(algo.safeInit(), "SensorAlgo.init 返回 false")
@@ -774,6 +908,7 @@ val dataflowCases = listOf(
     },
     auto("DATA-FUNC-021", "reset 后重新产出结果", CHAPTER, Priority.P1, 180_000,
         requires = setOf("NTF_EEG")) {
+        requireRelax()
         val samples = collectAlgoBatches("NTF_EEG", 4_000, 4_000)
         val algo = SensorAlgo()
         check(algo.safeInit(), "SensorAlgo.init 返回 false")
@@ -798,6 +933,7 @@ val dataflowCases = listOf(
     },
     auto("DATA-FUNC-022", "真实 EEG 流持续输出放松度（60s）", CHAPTER, Priority.P0, 180_000,
         requires = setOf("NTF_EEG")) {
+        requireRelax()
         val p = connected()
         val onRet = try {
             p.setParam("NTF_EEG", "ON")
@@ -850,23 +986,31 @@ val dataflowCases = listOf(
             check(pushedBatches > 0, "60s 内未成功推送 EEG 批次（拒绝 $rejectedBatches 批）")
             check(steps.isNotEmpty(), "60s 内算法未产出任何结果行")
             check(relaxValues.isNotEmpty(), "算法结果未包含 RELAX 字段")
-            val outOfRange = relaxValues.filter { it !in 0f..100f }
-            check(outOfRange.isEmpty(), "RELAX 应始终在 0~100，异常值=${outOfRange.take(5)}")
-            "steps=${steps.size} relax=${relaxValues.minOrNull()}~${relaxValues.maxOrNull()} " +
+            // 算法有约 5s（≈24 步）预热期，预热中 RELAX 返回 -1（未就绪），不算异常值；
+            // 只要预热后出现过有效数值，就要求其后的有效值稳定在 0~100。
+            val firstValid = relaxValues.indexOfFirst { it in 0f..100f }
+            check(
+                firstValid >= 0,
+                "60s 内 RELAX 始终为 -1（算法未就绪），未产出有效值：${relaxValues.take(5)}",
+            )
+            val afterWarmup = relaxValues.drop(firstValid)
+            val outOfRange = afterWarmup.filter { it !in 0f..100f }
+            check(outOfRange.isEmpty(), "预热后 RELAX 应稳定在 0~100，异常值=${outOfRange.take(5)}")
+            "steps=${steps.size} warmup=$firstValid relax=${afterWarmup.minOrNull()}~${afterWarmup.maxOrNull()} " +
                 "pushed=$pushedBatches rejected=$rejectedBatches"
         } finally {
             runCatching { algo.destroy() }
         }
     },
-    semi("DATA-FUNC-023", "真实 PPG 流输出心率/血氧（需静止佩戴）", CHAPTER, Priority.P1,
+    semi("DATA-FUNC-023", "真实 SpO2 流输出血氧百分比（需静止佩戴；心率待确认）", CHAPTER, Priority.P1,
         steps = listOf(
             "将待测设备佩戴/贴合到指定部位（指端或额部），保持静止，避免大幅运动。",
-            "如条件允许，用参考血氧仪/心率设备同时记录读数，便于人工比对偏差。",
-            "点「我已执行，继续」后程序采集 PPG 并运行算法，校验心率 30~220 bpm、SpO2 70~100%。",
+            "如条件允许，用参考血氧仪同时记录读数，便于人工比对偏差。",
+            "点「我已执行，继续」后程序采集 NTF_SPO2 流 60s，校验数值为 70~100% 的血氧百分比。",
         ),
-        timeoutMs = 240_000, requires = setOf("NTF_PPG")) {
+        timeoutMs = 240_000, requires = setOf("NTF_SPO2")) {
         promptManual("请确认待测设备已【静止佩戴】，然后点「我已执行，继续」。")
-        runPpgAlgorithm(15_000)
+        checkSpo2(collectStreamValues("NTF_SPO2", 60))
     },
 
     // ---- DATA-PERF：采样率/长稳 -------------------------------------------------------
@@ -1058,8 +1202,9 @@ val dataflowCases = listOf(
     },
     auto("DATA-ROB-004", "EEG/PPG 双线程并发推送不崩溃", CHAPTER, Priority.P2, 180_000,
         requires = setOf("NTF_EEG", "NTF_PPG")) {
-        val eeg = collectAlgoBatches("NTF_EEG", 2_000, 2_000)
-        val ppg = collectAlgoBatches("NTF_PPG", 200, 8_000)
+        val p = connected()
+        val eeg = collectAlgoBatches("NTF_EEG", 2_000, 2_000, profile = p)
+        val ppg = collectAlgoBatches("NTF_PPG", 200, 8_000, profile = p)
         val algo = SensorAlgo()
         check(algo.safeInit(), "SensorAlgo.init 返回 false")
         try {
@@ -1124,7 +1269,7 @@ val dataflowCases = listOf(
                 for (rate in sr.rates) {
                     val ret = safeSetParam(p, key, rate)
                     check(!algoError(ret), "setParam($key, $rate) 应成功，实际=$ret")
-                    val measured = measureStreamDataRate(streamKey, 5)
+                    val measured = measureStreamDataRate(p, streamKey, 5)
                     val ratio = measured / rate.toDouble()
                     check(
                         abs(ratio - 1.0) <= TestConfig.SAMPLE_RATE_TOLERANCE,

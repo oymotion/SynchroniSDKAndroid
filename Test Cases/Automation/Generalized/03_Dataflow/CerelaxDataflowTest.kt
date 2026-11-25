@@ -357,6 +357,9 @@ class CerelaxDataflowTest {
                     // 各流的 channelIndex 是独立编号空间，必须按 (dataType, channel) 分组再判单调
                     val last = lastByChannel.getOrPut(d.dataType to ch) { AtomicLong(-1) }
                     for (i in 0 until d.sampleCount) {
+                        // 末批/不足包可能是无效填充样本（gForceMax 实测 sc=10、奇通道 isDataValid=false 且 sampleIndex=0），
+                        // 无效样本没有有意义的时间序，不参与一致性与单调性断言。
+                        if (!d.isDataValid(ch, i)) continue
                         val s = d.getChannelSample(ch, i)
                         if (s != null) {
                             if (s.sampleIndex != d.getSampleIndex(ch, i)) consistent.set(false)
