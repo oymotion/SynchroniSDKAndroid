@@ -432,26 +432,49 @@ profile.log("User toggled filter 50Hz", "I") // profile log when enabled
 
 ## Demo app
 
-The bundled app (`com.oymotion.sensorcapiktdemo`) exercises the whole API:
-multi-device scan/connect with per-device state, three pages (Device / Bio /
-IMU), bio waveforms with a live band-pass filter picker, IMU waveforms with
-FFT spectra and a 3D quaternion cube, NTF/FILTER/sample-rate controls,
-battery display, auto reconnect, SDK debug log and bin export toggles, and
-bin replay / parse-to-CSV. A Multi Start/Stop toggle button starts (or
-stops) streaming on all connected devices in sync via
-`multiStartDataNotification` / `multiStopDataNotification`, and a Multi
-Replay Bin button replays several captures at once through
-`multiReplayBinFile` with group-wide pause/resume. The replay path defaults
-to `<session log dir>/test.bin`, and the Replay Bin button opens the system
-file picker and starts the replay on selection. Replay end-of-file is
-reported through `setOnDataTransferStateChangeListener` (isTransferring
-flips to false).
+The bundled app (`com.oymotion.sensorcapiktdemo`, demo version 0.1.50) has
+**Device**, **Bio**, and **IMU** pages:
 
-Build:
+- **Device**: continuous scan with an RSSI-sorted list, multi-device
+  connections, and a selected current device. Start/Stop controls a single
+  stream; Multi Start/Stop synchronizes all connected devices. Auto Reconnect,
+  Clone Data, SDK debug log/bin toggles, Translate IMU (on by default, meaning
+  split ACC/GYRO/EULER/QUAT streams), eight NTF switches, FILTER switches, and
+  EEG/EMG/IMU/PPG rate controls follow the current device. The title shows the
+  demo and SDK versions.
+- **Bio**: eight slots with EMG, paged EEG/ECG/BRTH, or the fixed PPG plot set.
+  An Angle stream adds a fixed 0-180 degree row. Supported rows include
+  per-stream FFT spectra and impedance side values; the Live Filter provides
+  Off and delta/theta/alpha/beta/gamma bands.
+- **IMU**: ACC/GYRO/MAG/EULER/QUAT waveforms, FFT spectra, real-time values,
+  and a 3D quaternion cube. MAG displays MAG-X/Y/Z in uT.
+- **BIN tools**: Replay Bin opens the Android file picker. Multi Replay Bin
+  accepts a `;`-separated path list and synchronizes group replay with
+  group-wide Pause/Resume and per-member Stop. Analyze Bin writes a `.csv`
+  beside the source file. Replay EOF is reported through
+  `setOnDataTransferStateChangeListener`. The text field defaults to
+  `<session log dir>/test.bin`.
+
+Build and install:
 
 ```sh
 ./gradlew assembleDebug
+# Windows: gradlew.bat assembleDebug
+# APK: app/build/outputs/apk/debug/app-debug.apk
 ```
+
+The demo enables `arm64-v8a` and `x86`; the x86 build supports UI and offline
+BIN workflows on a 32-bit emulator, while physical BLE requires a compatible
+device. On Android 11+, scoped storage prevents arbitrary `/sdcard` reads.
+Push test captures into the app-specific directory, then select them through
+the file picker:
+
+```sh
+adb push <bin> /sdcard/Android/data/com.oymotion.sensorcapiktdemo/files/
+```
+
+Writing logs and exports to shared `/sdcard/Documents/sensorsdklog` also needs
+the all-files-access permission described in Permissions.
 
 ## License
 
