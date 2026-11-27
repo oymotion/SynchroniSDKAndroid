@@ -44,10 +44,10 @@ android {
 }
 
 dependencies {
-    // Prebuilt AAR bundled in this project (libsensor.so + libsensorcapi_jni.so
-    // + the Java/Kotlin binding classes, all three ABIs). It was produced by
-    // bld/android/build_android.py in the SensorSDKCXX repo; refresh
-    // app/libs/sensorcapi-release.aar after changing the SDK sources.
+    // Prebuilt AAR (libsensor.so + libsensorcapi_jni.so + the Java/Kotlin
+    // binding classes, all three ABIs). Rebuild it with
+    // bld/android/build_android.py after changing the SDK sources; the
+    // source-build variant of this demo is example_android_capi_kt_dev.
     // A local AAR carries no transitive POM, so kotlin-stdlib is declared
     // explicitly below (it was `api` from the sensorcapi module before).
     implementation files('libs/sensorcapi-release.aar')
